@@ -3,12 +3,16 @@ import {
   Map as MapLibreMap,
   NavigationControl,
   Popup,
+  setWorkerUrl,
   type MapMouseEvent,
 } from "maplibre-gl";
+import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import type {
   AlertFeatureProperties,
   HazardFeatureCollection,
 } from "../types/schema";
+
+setWorkerUrl(new URL(maplibreWorkerUrl, window.location.href).href);
 
 const DEFAULT_REPO_FEED =
   "https://raw.githubusercontent.com/Savvyboi/skandalopetra/data-feed/alerts.geojson";
@@ -62,17 +66,21 @@ export function applyMapFilters(
 
   map.setFilter("hazards-fill", [
     "all",
-    ["==", ["geometry-type"], "Polygon"],
+    ["in", ["geometry-type"], ["literal", ["Polygon", "MultiPolygon"]]],
     combinedFilter,
   ]);
   map.setFilter("hazards-outline", [
     "all",
-    ["in", ["geometry-type"], ["literal", ["Polygon", "LineString"]]],
+    [
+      "in",
+      ["geometry-type"],
+      ["literal", ["Polygon", "MultiPolygon", "LineString", "MultiLineString"]],
+    ],
     combinedFilter,
   ]);
   map.setFilter("hazards-points", [
     "all",
-    ["==", ["geometry-type"], "Point"],
+    ["in", ["geometry-type"], ["literal", ["Point", "MultiPoint"]]],
     combinedFilter,
   ]);
 }
@@ -168,6 +176,11 @@ export function initMapCanvas(
     attributionControl: false,
   });
 
+  Object.defineProperty(container, "__maplibreMap", {
+    value: map,
+    configurable: true,
+  });
+
   map.addControl(new AttributionControl({ compact: true }), "bottom-right");
   map.addControl(
     new NavigationControl({ showCompass: true, visualizePitch: false }),
@@ -215,7 +228,7 @@ export function initMapCanvas(
       id: "hazards-fill",
       type: "fill",
       source: "hazards",
-      filter: ["==", ["geometry-type"], "Polygon"],
+      filter: ["in", ["geometry-type"], ["literal", ["Polygon", "MultiPolygon"]]],
       paint: {
         "fill-color": [
           "match",
@@ -236,7 +249,11 @@ export function initMapCanvas(
       id: "hazards-outline",
       type: "line",
       source: "hazards",
-      filter: ["in", ["geometry-type"], ["literal", ["Polygon", "LineString"]]],
+      filter: [
+        "in",
+        ["geometry-type"],
+        ["literal", ["Polygon", "MultiPolygon", "LineString", "MultiLineString"]],
+      ],
       paint: {
         "line-color": [
           "match",
@@ -257,7 +274,7 @@ export function initMapCanvas(
       id: "hazards-points",
       type: "circle",
       source: "hazards",
-      filter: ["==", ["geometry-type"], "Point"],
+      filter: ["in", ["geometry-type"], ["literal", ["Point", "MultiPoint"]]],
       paint: {
         "circle-color": [
           "match",
