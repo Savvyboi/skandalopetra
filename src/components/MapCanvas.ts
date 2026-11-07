@@ -5,7 +5,6 @@ import {
   Popup,
   type MapMouseEvent,
 } from "maplibre-gl";
-import "maplibre-gl/dist/maplibre-gl.css";
 import type {
   AlertFeatureProperties,
   HazardFeatureCollection,
@@ -91,9 +90,13 @@ async function fetchHazardCollection(): Promise<HazardFeatureCollection> {
     )
   );
 
+  const cacheBucket = Math.floor(Date.now() / 60000);
   for (const url of candidates) {
     try {
-      const res = await fetch(url, { cache: "no-cache" });
+      const bustUrl = url.startsWith("http")
+        ? `${url}${url.includes("?") ? "&" : "?"}t=${cacheBucket}`
+        : url;
+      const res = await fetch(bustUrl);
       if (!res.ok) continue;
       const json = (await res.json()) as HazardFeatureCollection;
       if (json && json.type === "FeatureCollection" && Array.isArray(json.features)) {
@@ -179,26 +182,29 @@ export function initMapCanvas(
     className: "hazard-hover-popup",
   });
 
-  const dataPromise = fetchHazardCollection();
-
-  map.on("load", async () => {
-    let collection: HazardFeatureCollection = {
-      type: "FeatureCollection",
-      metadata: {
-        generatedAt: Math.floor(Date.now() / 1000),
-        totalFeatures: 0,
-      },
-      features: [],
-    };
-
-    try {
-      collection = await dataPromise;
+  const dataPromise = fetchHazardCollection()
+    .then((collection) => {
       callbacks.onDataLoaded(collection);
-    } catch (err) {
+      return collection;
+    })
+    .catch((err) => {
       const msg =
         err instanceof Error ? err.message : "Failed to fetch hazard data.";
       callbacks.onDataError?.(msg);
-    }
+      const empty: HazardFeatureCollection = {
+        type: "FeatureCollection",
+        metadata: {
+          generatedAt: Math.floor(Date.now() / 1000),
+          totalFeatures: 0,
+        },
+        features: [],
+      };
+      return empty;
+    });
+
+  map.on("load", async () => {
+    map.resize();
+    const collection = await dataPromise;
 
     map.addSource("hazards", {
       type: "geojson",
