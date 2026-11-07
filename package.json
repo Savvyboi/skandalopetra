@@ -1,0 +1,28 @@
+{
+  "name": "skandalopetra",
+  "version": "1.0.0",
+  "description": "Global Aviation, Maritime & Weather Hazard Tracker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "ingest": "tsx scripts/ingest.ts"
+  },
+  "dependencies": {
+    "@turf/circle": "^7.2.0",
+    "@turf/helpers": "^7.2.0",
+    "csv-parse": "^7.0.3",
+    "fast-xml-parser": "^5.2.0",
+    "maplibre-gl": "^6.16.0"
+  },
+  "devDependencies": {
+    "@types/geojson": "^7946.0.16",
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0"
+  }
+}

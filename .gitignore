@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-data/
+public/alerts.geojson
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store

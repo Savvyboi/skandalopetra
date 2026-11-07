@@ -1,0 +1,173 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "navArea": "I", "name": "NAVAREA I (NE Atlantic & North Sea)", "coordinator": "United Kingdom" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-35, 48.45], [12, 48.45], [12, 71], [-35, 71], [-35, 48.45]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "II", "name": "NAVAREA II (East Atlantic)", "coordinator": "France" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-35, 7], [0, 7], [0, 48.45], [-35, 48.45], [-35, 7]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "III", "name": "NAVAREA III (Mediterranean & Black Sea)", "coordinator": "Spain" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-6, 30], [42, 30], [42, 47], [-6, 47], [-6, 30]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "IV", "name": "NAVAREA IV (NW Atlantic & Caribbean)", "coordinator": "United States" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-98, 7], [-35, 7], [-35, 67], [-98, 67], [-98, 7]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "V", "name": "NAVAREA V (SW Atlantic - Brazil)", "coordinator": "Brazil" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-53, -35.8], [-20, -35.8], [-20, 7], [-53, 7], [-53, -35.8]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "VI", "name": "NAVAREA VI (SW Atlantic - Argentina)", "coordinator": "Argentina" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-70, -60], [-20, -60], [-20, -35.8], [-70, -35.8], [-70, -60]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "VII", "name": "NAVAREA VII (SE Atlantic & SW Indian Ocean)", "coordinator": "South Africa" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-20, -60], [80, -60], [80, -10.5], [-20, -10.5], [-20, -60]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "VIII", "name": "NAVAREA VIII (Central & North Indian Ocean)", "coordinator": "India" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[55, -10.5], [98, -10.5], [98, 25], [55, 25], [55, -10.5]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "IX", "name": "NAVAREA IX (Red Sea, Persian Gulf & Arabian Sea)", "coordinator": "Pakistan" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[32, 12], [68, 12], [68, 31], [32, 31], [32, 12]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "X", "name": "NAVAREA X (Australia & Tasman Sea)", "coordinator": "Australia" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[80, -60], [170, -60], [170, -10], [80, -10], [80, -60]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XI", "name": "NAVAREA XI (NW Pacific & SE Asia)", "coordinator": "Japan" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[98, -10], [180, -10], [180, 42], [98, 42], [98, -10]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XII", "name": "NAVAREA XII (NE Pacific)", "coordinator": "United States" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-180, 0], [-105, 0], [-105, 67], [-180, 67], [-180, 0]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XIII", "name": "NAVAREA XIII (NW Pacific - Russian Far East)", "coordinator": "Russian Federation" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[130, 42], [180, 42], [180, 67], [130, 67], [130, 42]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XIV", "name": "NAVAREA XIV (South Pacific)", "coordinator": "New Zealand" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-180, -60], [-120, -60], [-120, 0], [-180, 0], [-180, -60]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XV", "name": "NAVAREA XV (SE Pacific - Chile)", "coordinator": "Chile" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-120, -60], [-70, -60], [-70, -18.35], [-120, -18.35], [-120, -60]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XVI", "name": "NAVAREA XVI (Eastern Tropical Pacific - Peru)", "coordinator": "Peru" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-120, -18.35], [-77, -18.35], [-77, 3.4], [-120, 3.4], [-120, -18.35]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XVII", "name": "NAVAREA XVII (Arctic - Beaufort Sea)", "coordinator": "Canada" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-170, 67], [-120, 67], [-120, 85], [-170, 85], [-170, 67]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XVIII", "name": "NAVAREA XVIII (Arctic - Canadian Archipelago & Baffin)", "coordinator": "Canada" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-120, 67], [-35, 67], [-35, 85], [-120, 85], [-120, 67]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XIX", "name": "NAVAREA XIX (Arctic - Norwegian & Barents Sea)", "coordinator": "Norway" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-35, 65], [32, 65], [32, 85], [-35, 85], [-35, 65]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XX", "name": "NAVAREA XX (Arctic - Kara & Laptev Sea)", "coordinator": "Russian Federation" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[32, 67], [125, 67], [125, 85], [32, 85], [32, 67]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "navArea": "XXI", "name": "NAVAREA XXI (Arctic - East Siberian & Chukchi Sea)", "coordinator": "Russian Federation" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[125, 67], [180, 67], [180, 85], [125, 85], [125, 67]]]
+      }
+    }
+  ]
+}

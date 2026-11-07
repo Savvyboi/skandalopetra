@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Real-time, historical (-7d), and forecast (+7d) global tracker for Aviation NOTAMs/TFRs, Maritime NAVAREA warnings, and Aviation/Marine Weather SIGMETs, METARs, and TAFs."
+    />
+    <title>Global Aviation, Maritime &amp; Weather Hazard Tracker | Skandalopetra</title>
+  </head>
+  <body>
+    <main id="app-main" class="app-shell">
+      <h1 class="visually-hidden">
+        Global Aviation, Maritime, and Weather Hazard Tracker
+      </h1>
+      <div id="map" class="map-viewport" role="application" aria-label="Interactive Global Hazard Map"></div>
+      <div id="filter-pills-mount" class="overlay-top-start"></div>
+      <div id="time-scrubber-mount" class="overlay-bottom-center"></div>
+    </main>
+
+    <aside
+      id="detail-drawer-mount"
+      class="detail-drawer"
+      aria-label="Hazard Inspector"
+      inert
+    ></aside>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
