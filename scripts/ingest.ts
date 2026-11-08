@@ -7,12 +7,18 @@ import type {
 } from "../src/types/schema.ts";
 import { fetchAwcWeatherHazards } from "./parsers/awcWeather.ts";
 import { fetchFaaNotamHazards } from "./parsers/faaNotam.ts";
+import { fetchFaaNasStatusHazards } from "./parsers/faaNasStatus.ts";
 import { fetchGlobalIcaoNotams } from "./parsers/globalNotam.ts";
 import { fetchNgaMaritimeHazards } from "./parsers/ngaMaritime.ts";
 import { fetchKystverketHazards } from "./parsers/kystverket.ts";
 import { fetchNwsAlerts } from "./parsers/nwsAlerts.ts";
 import { fetchDeceaNotamHazards } from "./parsers/deceaNotam.ts";
 import { fetchCcgNavwarnHazards } from "./parsers/ccgNavwarn.ts";
+import { fetchTraficomNavwarnHazards } from "./parsers/traficomNavwarn.ts";
+import { fetchNhcCycloneHazards } from "./parsers/nhcCyclones.ts";
+import { fetchEcccWeatherAlerts } from "./parsers/ecccWeatherAlerts.ts";
+import { fetchWashingtonVaacHazards } from "./parsers/washingtonVaac.ts";
+import { fetchShomPingHazards } from "./parsers/shomPing.ts";
 import {
   closePolygonRings,
   computeDurationHours,
@@ -104,6 +110,10 @@ function isUsableFeature(feature: HazardFeature | null | undefined): feature is 
   );
 }
 
+function cycloneStormPrefix(id: string): string {
+  return id.slice(0, id.lastIndexOf("-") + 1);
+}
+
 async function writeFeed(filePath: string, data: string): Promise<void> {
   const tempPath = `${filePath}.${process.pid}.tmp`;
   await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -190,6 +200,8 @@ async function main(): Promise<void> {
   const snapshots = new Map<string, ReadonlySet<string>>();
   const expiries = new Map<string, number>();
   const stationReports = new Map<string, { issuedAt: number; effectiveAt: number }>();
+  const ashAdvisories = new Map<string, number>();
+  let activeCyclones: ReadonlySet<string> | undefined;
   const recordSnapshot = (idPrefix: string, activeIds: ReadonlySet<string>) => {
     snapshots.set(idPrefix, activeIds);
   };
@@ -206,11 +218,22 @@ async function main(): Promise<void> {
     }),
     ngaMaritime: fetchNgaMaritimeHazards(now, recordSnapshot),
     faaNotam: fetchFaaNotamHazards(now),
+    faaNasStatus: fetchFaaNasStatusHazards(now, recordSnapshot),
     globalNotam: fetchGlobalIcaoNotams(now, recordExpiry),
     deceaNotam: fetchDeceaNotamHazards(now),
     kystverket: fetchKystverketHazards(now, recordSnapshot),
     ccgNavwarn: fetchCcgNavwarnHazards(now, recordSnapshot),
+    traficomNavwarn: fetchTraficomNavwarnHazards(now, recordSnapshot),
+    shomPing: fetchShomPingHazards(now, recordSnapshot),
+    nhcCyclones: fetchNhcCycloneHazards(now).then(({ features, activeStormPrefixes }) => {
+      activeCyclones = activeStormPrefixes;
+      return features;
+    }),
     nwsAlerts: fetchNwsAlerts(recordSnapshot),
+    ecccWeather: fetchEcccWeatherAlerts(recordSnapshot),
+    washingtonVaac: fetchWashingtonVaacHazards(now, (idPrefix, issuedAt) => {
+      ashAdvisories.set(idPrefix, Math.max(issuedAt, ashAdvisories.get(idPrefix) ?? 0));
+    }),
   };
   const names = Object.keys(jobs);
   const results = await Promise.allSettled(Object.values(jobs));
@@ -219,7 +242,14 @@ async function main(): Promise<void> {
     if (result.status === "fulfilled") {
       for (const feature of result.value) {
         if (isUsableFeature(feature)) {
-          featureMap.set(feature.properties.id, feature);
+          const p = feature.properties;
+          const previous = featureMap.get(p.id)?.properties;
+          // A stale listing must not reopen an advisory already retired in the archive.
+          if ((p.id.startsWith("NHC-TC-") || p.id.startsWith("W-VAAC-ASH-")) && previous && previous.validTo < p.validTo) {
+            p.validTo = previous.validTo;
+            p.durationHours = computeDurationHours(p.validFrom, p.validTo);
+          }
+          featureMap.set(p.id, feature);
           received++;
         }
       }
@@ -235,9 +265,31 @@ async function main(): Promise<void> {
   }
 
   const activeFeatures: HazardFeature[] = [];
+  const advisorySeries = new Map<string, HazardFeature["properties"][]>();
+  for (const { properties: p } of featureMap.values()) {
+    const prefix = p.id.startsWith("NHC-TC-") ? cycloneStormPrefix(p.id) : /^W-VAAC-ASH-\d{6}-/.exec(p.id)?.[0];
+    if (!prefix) continue;
+    const advisories = advisorySeries.get(prefix);
+    if (advisories) advisories.push(p);
+    else advisorySeries.set(prefix, [p]);
+  }
+  for (const [prefix, advisories] of advisorySeries) {
+    const issueTimes = new Set(advisories.map((p) => p.issuedAt));
+    const newAshAdvisory = ashAdvisories.get(prefix);
+    if (newAshAdvisory !== undefined) issueTimes.add(newAshAdvisory);
+    const times = [...issueTimes].sort((a, b) => a - b);
+    const nextIssue = new Map(times.slice(0, -1).map((time, index) => [time, times[index + 1]]));
+    for (const p of advisories) {
+      const cutoff = nextIssue.get(p.issuedAt);
+      if (cutoff !== undefined) expiries.set(p.id, cutoff - 1);
+    }
+  }
   for (const feature of featureMap.values()) {
     const p = feature.properties;
     let validTo = Math.min(p.validTo, expiries.get(p.id) ?? p.validTo);
+    if (activeCyclones && p.id.startsWith("NHC-TC-") && !activeCyclones.has(cycloneStormPrefix(p.id))) {
+      validTo = Math.min(validTo, now - 1);
+    }
     if (p.subType === "METAR" || p.subType === "TAF") {
       const report = stationReports.get(`${p.subType}-${p.stationOrArea}`);
       if (report && p.issuedAt < report.issuedAt) validTo = Math.min(validTo, report.effectiveAt - 1);

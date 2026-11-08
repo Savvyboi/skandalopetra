@@ -243,6 +243,8 @@ function normalizeFeatureProperties(
     sourceUrl: typeof raw.sourceUrl === "string" ? raw.sourceUrl : undefined,
     geometryNote:
       typeof raw.geometryNote === "string" ? raw.geometryNote : undefined,
+    validityNote:
+      typeof raw.validityNote === "string" ? raw.validityNote : undefined,
     issuedAt: Number(raw.issuedAt ?? 0),
     validFrom: Number(raw.validFrom ?? 0),
     validTo: Number(raw.validTo ?? 0),

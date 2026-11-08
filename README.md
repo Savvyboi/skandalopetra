@@ -24,10 +24,20 @@ A zero-backend, zero-paid-API, open-source static web application hosted on **Gi
 | [DECEA AISWEB](https://ajuda.decea.mil.br/base-de-conhecimento/o-que-e-a-api-aisweb/) | Brazilian domestic NOTAMs issued in the past 90 days and returned as current by AISWEB. Requires approved API credentials. Displays the B/C validity envelope and preserves schedule D in the bulletin. |
 | [Norwegian Coastal Administration](https://api.kystverket.no/openapi.json) | Norwegian coastal navigational warnings (`NAVWARN`) and NAVAREA XIX. Uses published GeoJSON, with coordinates extracted from the bulletin when available. |
 | [Canadian Coast Guard](https://e-navigation.canada.ca/gn/description/eng/81398d73-f082-4036-ad26-4ab5d9be3f46) | Canadian navigational warnings (`NAVWARN`) and Arctic NAVAREAs XVII/XVIII. Multiple mapped locations for one notice are grouped into one record. |
+| [Traficom Finland](https://julkinen.traficom.fi/inspirepalvelu/avoin/wfs?request=getcapabilities) | Finnish navigational warnings (`NAVWARN`) from the official point, line, and area layers. When no end time is published, the display window is renewed while the warning stays active. |
+| [France’s SHOM PING](https://portail.ping-info-nautique.fr/) | NAVAREA II and French coastal, local, and overseas warnings. Published footprints and schedules are preserved where available, and broader areas or timing envelopes are labelled. |
+| [FAA NAS Status](https://nasstatus.faa.gov/) | U.S. airport closures, qualified access restrictions, and ground stops with explicit UTC windows and FAA airport reference points (`NAS STATUS`). Recurring schedules require separate interval handling. |
 | [NOAA Aviation Weather Center](https://aviationweather.gov/data/api/) | U.S. Center Weather Advisories (`CWA`) and Alaska `AIRMET` areas for the validity windows provided by AWC. |
-| [NOAA National Weather Service](https://www.weather.gov/documentation/services-web-alerts) | Selected U.S. severe weather and marine CAP products (`NWS ALERT`) with an explicit warning polygon. Zone-only alerts are outside this adapter’s coverage. |
+| [NOAA National Weather Service](https://www.weather.gov/documentation/services-web-alerts) | Selected U.S. severe weather and marine CAP products (`NWS ALERT`). Uses published alert polygons or, for supported marine products, simplified [official forecast zones](https://www.weather.gov/gis/MarineZones) when all referenced zones resolve. |
+| [NOAA NHC and CPHC](https://www.nhc.noaa.gov/CurrentStorms.json) | Reported tropical cyclone centers for the Atlantic, eastern North Pacific, and central North Pacific. Each advisory is displayed until superseded or nine hours after issuance. The official advisory describes the forecast and warning areas. |
+| [NOAA Washington VAAC](https://ospo.noaa.gov/products/atmosphere/vaac/) | Observed and estimated volcanic ash polygons and altitude bands from operational IWXXM advisories. The timeline uses the advisory window and retires superseded observations. |
+| [Environment and Climate Change Canada](https://eccc-msc.github.io/open-data/msc-data/alerts/readme_alerts_en/) | Current GeoMet weather alerts (`CANADA WEATHER`) with publisher-supplied polygons, official risk colours, and original English bulletin text. Identical bulletins are grouped across their affected areas. |
 
 Canadian warning data is provided by the Canadian Coast Guard and Department of Fisheries and Oceans under the [Canadian Coast Guard Open Information Licence](https://www.canada.ca/en/canadian-coast-guard/corporate/publications/open-information-licence.html). The inspector links to the original notices.
+
+Finnish warning data comes from the Finnish Transport and Communications Agency Traficom under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Skandalopetra normalizes warning fields and groups geometries for display. [Original Traficom WFS](https://julkinen.traficom.fi/inspirepalvelu/avoin/wfs?request=getcapabilities)
+
+French warning data comes from [SHOM PING](https://portail.ping-info-nautique.fr/) under the [Etalab Open Licence 2.0](https://portail.ping-info-nautique.fr/static/cgu). Contains information licenced under the [Data Server End-use Licence of Environment and Climate Change Canada](https://eccc-msc.github.io/open-data/licence/readme_en/).
 
 ## Local Development
 
@@ -51,4 +61,4 @@ npm run build
 1. In your GitHub repository (**Settings → Pages**), set **Build and deployment → Source** to **GitHub Actions**.
 2. Trigger **Update Global Hazard Feed** (`ingest-data.yml`) once manually via the **Actions** tab (or wait up to 15 minutes for the cron schedule) to initialize the `data-feed` branch.
 3. *(Optional)* Add `DECEA_API_KEY` and `DECEA_API_PASS` under **Settings → Secrets and variables → Actions** after [obtaining DECEA access](https://ajuda.decea.mil.br/base-de-conhecimento/o-que-e-a-api-aisweb/).
-4. The legacy FAA External NOTAM adapter uses `FAA_CLIENT_ID` and `FAA_CLIENT_SECRET` where that service remains available. The successor [FAA NOTAM Management Service](https://www.faa.gov/about/initiatives/notam) requires separate onboarding.
+4. The legacy FAA External NOTAM adapter uses `FAA_CLIENT_ID` and `FAA_CLIENT_SECRET` where that service remains available. To integrate the successor FAA NOTAM Management Service, request approved distribution credentials and the current API specification from the FAA NOTAM Service Center. [FAA NMS access FAQ](https://www.faa.gov/about/initiatives/notam/faqs)

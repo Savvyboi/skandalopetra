@@ -98,6 +98,10 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
   geometryNote.className = "drawer-note";
   geometryNote.hidden = true;
 
+  const validityNote = document.createElement("p");
+  validityNote.className = "drawer-note";
+  validityNote.hidden = true;
+
   const sourceLink = document.createElement("a");
   sourceLink.className = "drawer-source";
   sourceLink.textContent = "Open official source";
@@ -118,6 +122,43 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
   );
   ccgAttribution.hidden = true;
 
+  const traficomAttribution = document.createElement("p");
+  traficomAttribution.className = "drawer-note";
+  const traficomSource = document.createElement("a");
+  traficomSource.className = "drawer-source";
+  traficomSource.href = "https://julkinen.traficom.fi/inspirepalvelu/avoin/wfs?request=getcapabilities";
+  traficomSource.textContent = "Finnish Transport and Communications Agency Traficom";
+  const traficomLicence = document.createElement("a");
+  traficomLicence.className = "drawer-source";
+  traficomLicence.href = "https://creativecommons.org/licenses/by/4.0/";
+  traficomLicence.textContent = "CC BY 4.0";
+  traficomAttribution.append("Source ", traficomSource, ". ", traficomLicence,
+    ". Warning fields normalized and geometries grouped for display.");
+  traficomAttribution.hidden = true;
+
+  const ecccAttribution = document.createElement("p");
+  ecccAttribution.className = "drawer-note";
+  const ecccLicence = document.createElement("a");
+  ecccLicence.className = "drawer-source";
+  ecccLicence.href = "https://eccc-msc.github.io/open-data/licence/readme_en/";
+  ecccLicence.textContent = "Data Server End-use Licence of Environment and Climate Change Canada";
+  ecccAttribution.append("Contains information licenced under the ", ecccLicence, ".");
+  ecccAttribution.hidden = true;
+
+  const pingAttribution = document.createElement("p");
+  pingAttribution.className = "drawer-note";
+  const pingSource = document.createElement("a");
+  pingSource.className = "drawer-source";
+  pingSource.href = "https://portail.ping-info-nautique.fr/";
+  pingSource.textContent = "SHOM PING";
+  const pingLicence = document.createElement("a");
+  pingLicence.className = "drawer-source";
+  pingLicence.href = "https://portail.ping-info-nautique.fr/static/cgu";
+  pingLicence.textContent = "Etalab Open Licence 2.0";
+  const pingDate = document.createElement("span");
+  pingAttribution.append("Source ", pingSource, ". ", pingLicence, ". ", pingDate);
+  pingAttribution.hidden = true;
+
   const marineSection = document.createElement("div");
   marineSection.className = "marine-telemetry-box";
   marineSection.hidden = true;
@@ -133,7 +174,8 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
   const codeEl = document.createElement("code");
   preEl.appendChild(codeEl);
 
-  body.append(alternatives, titleEl, metaGrid, geometryNote, sourceLink, ccgAttribution, marineSection, rawLabel, preEl);
+  body.append(alternatives, titleEl, metaGrid, validityNote, geometryNote, sourceLink,
+    ccgAttribution, traficomAttribution, ecccAttribution, pingAttribution, marineSection, rawLabel, preEl);
   container.append(header, body);
   mount.replaceChildren(container);
 
@@ -311,7 +353,7 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
     addMetaItem("Footprint Size", formatAreaSqKm(properties.areaSqKm));
     addMetaItem("Duration", formatDurationHours(properties.durationHours));
     addMetaItem("Effective From", formatUtcTimestamp(properties.validFrom));
-    addMetaItem("Effective Until", formatUtcTimestamp(properties.validTo));
+    addMetaItem(properties.validityNote ? "Display Until" : "Effective Until", formatUtcTimestamp(properties.validTo));
     addMetaItem("Issued At", formatUtcTimestamp(properties.issuedAt));
 
     const altStr = formatAltitudeRange(
@@ -328,8 +370,15 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
     );
 
     codeEl.textContent = properties.rawText || "No raw bulletin text provided.";
-    rawLabel.textContent = properties.subType === "AIRMET" ? "Decoded Advisory" : "Bulletin";
+    rawLabel.textContent = ["AIRMET", "TROPICAL CYCLONE", "VOLCANIC ASH"].includes(properties.subType)
+      ? "Advisory Summary" : "Bulletin";
     ccgAttribution.hidden = !properties.id.startsWith("CCG-NAVWARN-");
+    traficomAttribution.hidden = !properties.id.startsWith("TRAFICOM-NAVWARN-");
+    ecccAttribution.hidden = !properties.id.startsWith("ECCC-ALERT-");
+    pingAttribution.hidden = !properties.id.startsWith("SHOM-PING-");
+    if (!pingAttribution.hidden) pingDate.textContent = `Published ${formatUtcTimestamp(properties.issuedAt)}.`;
+    validityNote.textContent = properties.validityNote ?? "";
+    validityNote.hidden = !properties.validityNote;
     geometryNote.textContent = properties.geometryNote ?? "";
     geometryNote.hidden = !properties.geometryNote;
     sourceLink.removeAttribute("href");
