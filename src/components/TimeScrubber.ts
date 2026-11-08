@@ -7,6 +7,15 @@ const STEP_SEC = 900; // 15-minute increments
 const SEVEN_DAYS_SEC = 7 * 86400;
 const PLAY_ADVANCE_SEC = 3600; // +1 hour per tick
 const PLAY_INTERVAL_MS = 250;
+const LIVE_UPDATE_MS = 15_000;
+
+function nowSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function timelineAnchor(timestampSec: number): number {
+  return Math.floor(timestampSec / STEP_SEC) * STEP_SEC;
+}
 
 export function formatUtcTimestamp(unixSec: number): string {
   const d = new Date(unixSec * 1000);
@@ -20,7 +29,8 @@ export function formatUtcTimestamp(unixSec: number): string {
 
 function formatRelativeOffset(targetSec: number, refSec: number): string {
   const diff = targetSec - refSec;
-  if (Math.abs(diff) < STEP_SEC) return "Now";
+  if (diff === 0) return "Now";
+  if (Math.abs(diff) < 60) return diff > 0 ? "+<1m" : "-<1m";
   const sign = diff > 0 ? "+" : "-";
   const abs = Math.abs(diff);
   const days = Math.floor(abs / 86400);
@@ -39,11 +49,11 @@ export function initTimeScrubber(
   mount: HTMLElement,
   onTimestampChange: (timestampSec: number) => void
 ): TimeScrubberController {
-  const anchorNowSec =
-    Math.floor(Date.now() / 1000 / STEP_SEC) * STEP_SEC;
+  let currentSec = nowSeconds();
+  let isLive = true;
+  const anchorNowSec = timelineAnchor(currentSec);
   let minSec = anchorNowSec - SEVEN_DAYS_SEC;
   let maxSec = anchorNowSec + SEVEN_DAYS_SEC;
-  let currentSec = anchorNowSec;
   let playTimer: number | null = null;
 
   const panel = document.createElement("div");
@@ -108,7 +118,7 @@ export function initTimeScrubber(
   slider.min = String(minSec);
   slider.max = String(maxSec);
   slider.step = String(STEP_SEC);
-  slider.value = String(currentSec);
+  slider.value = String(anchorNowSec);
 
   const ticksRow = document.createElement("div");
   ticksRow.className = "scrubber-ticks";
@@ -126,33 +136,29 @@ export function initTimeScrubber(
   mount.replaceChildren(panel);
 
   function syncUi(): void {
-    const liveRefSec =
-      Math.floor(Date.now() / 1000 / STEP_SEC) * STEP_SEC;
+    const liveRefSec = nowSeconds();
     const utcStr = formatUtcTimestamp(currentSec);
     timestampReadout.textContent = utcStr;
     timestampReadout.dateTime = new Date(currentSec * 1000).toISOString();
-    offsetReadout.textContent = formatRelativeOffset(currentSec, liveRefSec);
+    offsetReadout.textContent = isLive
+      ? "Now"
+      : formatRelativeOffset(currentSec, liveRefSec);
 
-    let modeLabel = "LIVE NOW";
-    if (currentSec < liveRefSec - STEP_SEC) {
-      modeLabel = "PAST ARCHIVE";
-      modeBadge.className = "mode-badge mode-past";
-      slider.dataset.mode = "past";
-    } else if (currentSec > liveRefSec + STEP_SEC) {
-      modeLabel = "FUTURE FORECAST";
-      modeBadge.className = "mode-badge mode-future";
-      slider.dataset.mode = "future";
-    } else {
-      modeLabel = "LIVE NOW";
-      modeBadge.className = "mode-badge mode-live";
-      slider.dataset.mode = "live";
-    }
+    const mode = isLive ? "live" : currentSec > liveRefSec ? "future" : "past";
+    const modeLabels = {
+      live: "LIVE NOW",
+      future: "FUTURE FORECAST",
+      past: "PAST ARCHIVE",
+    };
+    const modeLabel = modeLabels[mode];
+    modeBadge.className = `mode-badge mode-${mode}`;
+    slider.dataset.mode = mode;
     modeBadge.textContent = modeLabel;
 
     // Sync CSS custom properties for cross-browser slider fill (progress() + calc() fallback)
     slider.style.setProperty("--attr-min", String(minSec));
     slider.style.setProperty("--attr-max", String(maxSec));
-    slider.style.setProperty("--control-value", String(currentSec));
+    slider.style.setProperty("--control-value", slider.value);
     slider.setAttribute("aria-valuetext", `${utcStr} (${modeLabel})`);
   }
 
@@ -164,18 +170,17 @@ export function initTimeScrubber(
     }
   }
 
-  function setTimestamp(nextSec: number, emit = true): void {
+  function setTimestamp(nextSec: number): void {
+    isLive = false;
     currentSec = Math.max(minSec, Math.min(maxSec, nextSec));
     slider.value = String(currentSec);
     syncUi();
-    if (emit) {
-      onTimestampChange(currentSec);
-    }
+    onTimestampChange(currentSec);
   }
 
   slider.addEventListener("input", () => {
     stopPlayback();
-    setTimestamp(Number(slider.value), true);
+    setTimestamp(slider.valueAsNumber);
   });
 
   playBtn.addEventListener("click", () => {
@@ -184,37 +189,54 @@ export function initTimeScrubber(
       return;
     }
     if (currentSec >= maxSec) {
-      setTimestamp(minSec, true);
+      setTimestamp(minSec);
+    } else if (isLive) {
+      setTimestamp(timelineAnchor(currentSec));
     }
     setPlayButtonVisual(true);
     playTimer = window.setInterval(() => {
       const next = currentSec + PLAY_ADVANCE_SEC;
-      if (next > maxSec) {
-        setTimestamp(maxSec, true);
+      if (next >= maxSec) {
+        setTimestamp(maxSec);
         stopPlayback();
       } else {
-        setTimestamp(next, true);
+        setTimestamp(next);
       }
     }, PLAY_INTERVAL_MS);
   });
 
-  function resetToLive(): void {
-    stopPlayback();
-    const freshNow = Math.floor(Date.now() / 1000 / STEP_SEC) * STEP_SEC;
-    minSec = freshNow - SEVEN_DAYS_SEC;
-    maxSec = freshNow + SEVEN_DAYS_SEC;
+  function updateLiveTime(): void {
+    currentSec = nowSeconds();
+    const anchor = timelineAnchor(currentSec);
+    minSec = anchor - SEVEN_DAYS_SEC;
+    maxSec = anchor + SEVEN_DAYS_SEC;
     slider.min = String(minSec);
     slider.max = String(maxSec);
-    setTimestamp(freshNow, true);
+    slider.value = String(anchor);
+    syncUi();
+    onTimestampChange(currentSec);
+  }
+
+  function resetToLive(): void {
+    stopPlayback();
+    isLive = true;
+    updateLiveTime();
   }
 
   liveBtn.addEventListener("click", resetToLive);
+  function tick(): void {
+    if (document.hidden) return;
+    if (isLive) updateLiveTime();
+    else syncUi();
+  }
+  window.setInterval(tick, LIVE_UPDATE_MS);
+  document.addEventListener("visibilitychange", tick);
 
   syncUi();
 
   return {
     getTimestampSec() {
-      return currentSec;
+      return isLive ? nowSeconds() : currentSec;
     },
     resetToLive,
   };

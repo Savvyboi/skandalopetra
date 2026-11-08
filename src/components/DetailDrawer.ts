@@ -2,7 +2,7 @@ import type { SelectedMapHazard } from "./MapCanvas";
 import { formatUtcTimestamp } from "./TimeScrubber";
 
 export interface DetailDrawerController {
-  open: (hazard: SelectedMapHazard) => void;
+  open: (hazards: SelectedMapHazard[]) => void;
   close: () => void;
 }
 
@@ -10,7 +10,7 @@ interface OpenMeteoMarineResponse {
   current?: {
     wave_height?: number | null;
     wave_direction?: number | null;
-    wave_period?: number | null;
+    swell_wave_period?: number | null;
   };
   hourly?: {
     wave_height?: Array<number | null>;
@@ -54,6 +54,8 @@ function formatDurationHours(hours: number): string {
 
 export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
   let marineAbort: AbortController | null = null;
+  let restoreFocus: HTMLElement | null = null;
+  let selections: SelectedMapHazard[] = [];
 
   const container = document.createElement("div");
   container.className = "glass-panel drawer-card";
@@ -80,8 +82,41 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
   const titleEl = document.createElement("h2");
   titleEl.className = "drawer-title";
 
+  const alternatives = document.createElement("label");
+  alternatives.className = "filter-field";
+  const alternativesLabel = document.createElement("span");
+  alternativesLabel.className = "filter-field-label";
+  const alternativesSelect = document.createElement("select");
+  alternativesSelect.className = "filter-select";
+  alternatives.append(alternativesLabel, alternativesSelect);
+  alternatives.hidden = true;
+
   const metaGrid = document.createElement("dl");
   metaGrid.className = "drawer-meta-grid";
+
+  const geometryNote = document.createElement("p");
+  geometryNote.className = "drawer-note";
+  geometryNote.hidden = true;
+
+  const sourceLink = document.createElement("a");
+  sourceLink.className = "drawer-source";
+  sourceLink.textContent = "Open official source";
+  sourceLink.target = "_blank";
+  sourceLink.rel = "noopener noreferrer";
+  sourceLink.hidden = true;
+
+  const ccgAttribution = document.createElement("p");
+  ccgAttribution.className = "drawer-note";
+  const ccgLicence = document.createElement("a");
+  ccgLicence.className = "drawer-source";
+  ccgLicence.href = "https://www.canada.ca/en/canadian-coast-guard/corporate/publications/open-information-licence.html";
+  ccgLicence.textContent = "Canadian Coast Guard Open Information Licence";
+  ccgAttribution.append(
+    "Contains information published by the Canadian Coast Guard and Department of Fisheries and Oceans licensed under the ",
+    ccgLicence,
+    ". This Information is available in its original format for free download on the Canadian Coast Guard website and the Monthly Edition of the Notices to Mariners (NOTMAR) website."
+  );
+  ccgAttribution.hidden = true;
 
   const marineSection = document.createElement("div");
   marineSection.className = "marine-telemetry-box";
@@ -89,7 +124,7 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
 
   const rawLabel = document.createElement("h3");
   rawLabel.className = "drawer-section-heading";
-  rawLabel.textContent = "Verbatim Bulletin";
+  rawLabel.textContent = "Bulletin";
 
   const preEl = document.createElement("pre");
   preEl.className = "bulletin-pre";
@@ -98,7 +133,7 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
   const codeEl = document.createElement("code");
   preEl.appendChild(codeEl);
 
-  body.append(titleEl, metaGrid, marineSection, rawLabel, preEl);
+  body.append(alternatives, titleEl, metaGrid, geometryNote, sourceLink, ccgAttribution, marineSection, rawLabel, preEl);
   container.append(header, body);
   mount.replaceChildren(container);
 
@@ -109,6 +144,8 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
     }
     mount.dataset.open = "false";
     mount.inert = true;
+    restoreFocus?.focus({ preventScroll: true });
+    restoreFocus = null;
   }
 
   closeBtn.addEventListener("click", close);
@@ -156,10 +193,12 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
       lat.toFixed(4)
     )}&longitude=${encodeURIComponent(
       lon.toFixed(4)
-    )}&current=wave_height,wave_direction,wave_period&hourly=wave_height&forecast_days=3`;
+    )}&current=wave_height,wave_direction,swell_wave_period&hourly=wave_height&forecast_hours=72`;
 
     try {
-      const res = await fetch(url, { signal: controller.signal });
+      const res = await fetch(url, {
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
+      });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -167,7 +206,7 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
       if (controller.signal.aborted) return;
 
       const curHeight = data.current?.wave_height;
-      const curPeriod = data.current?.wave_period;
+      const curPeriod = data.current?.swell_wave_period;
       const curDir = data.current?.wave_direction;
       const hourlyWaves = (data.hourly?.wave_height ?? []).filter(
         (v): v is number => typeof v === "number" && Number.isFinite(v)
@@ -215,7 +254,7 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
             ? `${curHeight.toFixed(1)} m`
             : "—",
           curDir !== null && curDir !== undefined
-            ? `Dir ${Math.round(curDir)}°`
+            ? `From ${Math.round(curDir)}°`
             : undefined
         ),
         makeMetric(
@@ -239,7 +278,7 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
     }
   }
 
-  function open({ properties, lngLat }: SelectedMapHazard): void {
+  function renderHazard({ properties, lngLat }: SelectedMapHazard): void {
     badgesWrap.replaceChildren();
 
     const domainBadge = document.createElement("span");
@@ -279,7 +318,7 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
       properties.altitudeMinFt,
       properties.altitudeMaxFt
     );
-    if (altStr) {
+    if (altStr && properties.subType !== "TAF") {
       addMetaItem("Altitude Limits", altStr);
     }
 
@@ -289,6 +328,23 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
     );
 
     codeEl.textContent = properties.rawText || "No raw bulletin text provided.";
+    rawLabel.textContent = properties.subType === "AIRMET" ? "Decoded Advisory" : "Bulletin";
+    ccgAttribution.hidden = !properties.id.startsWith("CCG-NAVWARN-");
+    geometryNote.textContent = properties.geometryNote ?? "";
+    geometryNote.hidden = !properties.geometryNote;
+    sourceLink.removeAttribute("href");
+    sourceLink.hidden = true;
+    if (properties.sourceUrl) {
+      try {
+        const url = new URL(properties.sourceUrl);
+        if (url.protocol === "https:" && !url.username && !url.password) {
+          sourceLink.href = url.href;
+          sourceLink.hidden = false;
+        }
+      } catch {
+        // Keep an invalid source URL out of the inspector.
+      }
+    }
 
     if (properties.domain === "maritime") {
       void loadMarineConditions(lngLat[0], lngLat[1]);
@@ -301,9 +357,34 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
       marineSection.replaceChildren();
     }
 
+  }
+
+  alternativesSelect.addEventListener("change", () => {
+    const selection = selections[alternativesSelect.selectedIndex];
+    if (selection) renderHazard(selection);
+  });
+
+  function open(hazards: SelectedMapHazard[]): void {
+    if (hazards.length === 0) return;
+    if (mount.dataset.open !== "true" && document.activeElement instanceof HTMLElement) {
+      restoreFocus = document.activeElement;
+    }
+    selections = hazards;
+    alternatives.hidden = hazards.length < 2;
+    alternativesLabel.textContent = `Alerts at this location (${hazards.length})`;
+    alternativesSelect.replaceChildren();
+    if (hazards.length > 1) {
+      for (const { properties } of hazards) {
+        const option = document.createElement("option");
+        option.textContent = `${properties.subType} · ${properties.title}`;
+        alternativesSelect.appendChild(option);
+      }
+    }
+    renderHazard(hazards[0]);
+    body.scrollTop = 0;
     mount.inert = false;
     mount.dataset.open = "true";
-    closeBtn.focus();
+    closeBtn.focus({ preventScroll: true });
   }
 
   return { open, close };

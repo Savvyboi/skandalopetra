@@ -3,6 +3,27 @@ import type { Geometry, Position } from "geojson";
 
 const EARTH_RADIUS_KM = 6371.0088;
 
+/** Closes source polygon rings while preserving the original geometry when already closed. */
+export function closePolygonRings(geometry: Geometry): Geometry {
+  let changed = false;
+  const close = (rings: Position[][]) => rings.map((ring) => {
+    const first = ring[0];
+    const last = ring.at(-1);
+    if (!first || !last || (first[0] === last[0] && first[1] === last[1])) return ring;
+    changed = true;
+    return [...ring, first];
+  });
+  if (geometry.type === "Polygon") {
+    const coordinates = close(geometry.coordinates);
+    return changed ? { ...geometry, coordinates } : geometry;
+  }
+  if (geometry.type === "MultiPolygon") {
+    const coordinates = geometry.coordinates.map(close);
+    return changed ? { ...geometry, coordinates } : geometry;
+  }
+  return geometry;
+}
+
 /**
  * Extracts Degrees-Decimal-Minutes or Degrees-Minutes-Seconds coordinates from NGA / UKHO / JCG / HNHS text.
  * Supports:
@@ -11,13 +32,14 @@ const EARTH_RADIUS_KM = 6371.0088;
  *  - HNHS spaced/Greek DDM: 37 48.34N - 023 46.62E, 38-01.71B 022-51.00A (Greek Β=N, Α=E, Ν=S)
  */
 export function parseNgaCoordinates(rawText: string): [number, number][] {
-  const coords: [number, number][] = [];
+  const matches: Array<{ index: number; point: [number, number] }> = [];
 
   // 1. DMS with hyphens: 24-28-29N 132-46-04E
   const dmsHyphenRegex =
-    /\b(\d{1,2})-(\d{2})-(\d{2}(?:\.\d+)?)\s*([NS])\s*(?:-\s*)?(\d{1,3})-(\d{2})-(\d{2}(?:\.\d+)?)\s*([EW])\b/gi;
+    /\b(\d{1,2})-(\d{2})-(\d{2}(?:\.\d+)?)\s*([NS])\s*(?:[-,]\s*)?(\d{1,3})-(\d{2})-(\d{2}(?:\.\d+)?)\s*([EW])\b/gi;
   let m: RegExpExecArray | null;
   while ((m = dmsHyphenRegex.exec(rawText)) !== null) {
+    if ([m[2], m[3], m[6], m[7]].some((part) => Number(part) >= 60)) continue;
     let lat =
       parseInt(m[1], 10) +
       parseInt(m[2], 10) / 60 +
@@ -29,15 +51,14 @@ export function parseNgaCoordinates(rawText: string): [number, number][] {
       parseFloat(m[7]) / 3600;
     if (m[8].toUpperCase() === "W") lon = -lon;
     if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
-      coords.push([Number(lon.toFixed(5)), Number(lat.toFixed(5))]);
+      matches.push({ index: m.index, point: [Number(lon.toFixed(5)), Number(lat.toFixed(5))] });
     }
   }
-  if (coords.length > 0) return coords;
 
   // 2. DDM with hyphens or spaces (including Greek Β/B=N, Α/A=E):
   //    58-12.5N 019-30.0E | 37 48.34N - 023 46.62E | 38-01.71B 022-51.00A
   const ddmRegex =
-    /\b(\d{1,2})[-\s](\d{2}(?:[.,]\d+)?)\s*([NSB\u0392\u039d])\s*(?:-\s*)?(\d{1,3})[-\s](\d{2}(?:[.,]\d+)?)\s*([EWA\u0391])\b/gi;
+    /(?<![\p{L}\d-])(\d{1,2})[-\s](\d{2}(?:[.,]\d+)?)\s*([NSB\u0392\u039d])\s*(?:[-,]\s*)?(\d{1,3})[-\s](\d{2}(?:[.,]\d+)?)\s*([EWA\u0391])(?=$|[^\p{L}\d])/giu;
   while ((m = ddmRegex.exec(rawText)) !== null) {
     const latDeg = parseInt(m[1], 10);
     const latMin = parseFloat(m[2].replace(",", "."));
@@ -54,11 +75,11 @@ export function parseNgaCoordinates(rawText: string): [number, number][] {
     if (lonHem === "W") lon = -lon;
 
     if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
-      coords.push([Number(lon.toFixed(5)), Number(lat.toFixed(5))]);
+      matches.push({ index: m.index, point: [Number(lon.toFixed(5)), Number(lat.toFixed(5))] });
     }
   }
 
-  return coords;
+  return matches.sort((a, b) => a.index - b.index).map((match) => match.point);
 }
 
 /**
@@ -69,18 +90,18 @@ export function parseNgaCoordinates(rawText: string): [number, number][] {
 export function parseIcaoNotamBodyCoords(bodyText: string): [number, number][] {
   const coords: [number, number][] = [];
   const regex =
-    /\b(\d{2})(\d{2})(\d{2}(?:\.\d+)?)?([NS])\s*(\d{3})(\d{2})(\d{2}(?:\.\d+)?)?([EW])\b/g;
+    /\b(\d{2})(\d{2}(?:\.\d+)?)(\d{2}(?:\.\d+)?)?([NS])\s*(?:[-,]\s*)?(\d{3})(\d{2}(?:\.\d+)?)(\d{2}(?:\.\d+)?)?([EW])\b/gi;
   let m: RegExpExecArray | null;
   while ((m = regex.exec(bodyText)) !== null) {
     const latDeg = parseInt(m[1], 10);
-    const latMin = parseInt(m[2], 10);
+    const latMin = Number(m[2]);
     const latSec = m[3] ? parseFloat(m[3]) : 0;
-    const latHem = m[4];
+    const latHem = m[4].toUpperCase();
 
     const lonDeg = parseInt(m[5], 10);
-    const lonMin = parseInt(m[6], 10);
+    const lonMin = Number(m[6]);
     const lonSec = m[7] ? parseFloat(m[7]) : 0;
-    const lonHem = m[8];
+    const lonHem = m[8].toUpperCase();
 
     if (latDeg > 90 || latMin >= 60 || latSec >= 60) continue;
     if (lonDeg > 180 || lonMin >= 60 || lonSec >= 60) continue;
@@ -89,6 +110,7 @@ export function parseIcaoNotamBodyCoords(bodyText: string): [number, number][] {
     let lon = lonDeg + lonMin / 60 + lonSec / 3600;
     if (latHem === "S") lat = -lat;
     if (lonHem === "W") lon = -lon;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
 
     const pt: [number, number] = [Number(lon.toFixed(5)), Number(lat.toFixed(5))];
     const prev = coords[coords.length - 1];
@@ -119,16 +141,16 @@ function unwrapAntimeridian(coords: [number, number][]): [number, number][] {
 export function coordsToGeoJsonGeometry(
   coords: [number, number][]
 ): Geometry | null {
-  if (coords.length === 0) return null;
-  if (coords.length === 1) {
+  const distinct = new Map(coords.map((point) => [point.join(","), point]));
+  if (distinct.size === 0) return null;
+  if (distinct.size === 1) {
     return { type: "Point", coordinates: coords[0] };
   }
-  const unwrapped = unwrapAntimeridian(coords);
-  if (unwrapped.length === 2) {
-    return { type: "LineString", coordinates: unwrapped };
+  if (distinct.size === 2) {
+    return { type: "LineString", coordinates: unwrapAntimeridian([...distinct.values()]) };
   }
 
-  const ring = [...unwrapped];
+  const ring = unwrapAntimeridian(coords);
   const first = ring[0];
   const last = ring[ring.length - 1];
   if (first[0] !== last[0] || first[1] !== last[1]) {
@@ -149,12 +171,14 @@ export function parseNotamQLineCircle(
     qCoordToken.trim()
   );
   if (!match) return null;
+  if (Number(match[2]) >= 60 || Number(match[5]) >= 60) return null;
 
   let lat = parseInt(match[1], 10) + parseInt(match[2], 10) / 60;
   if (match[3] === "S") lat = -lat;
 
   let lon = parseInt(match[4], 10) + parseInt(match[5], 10) / 60;
   if (match[6] === "W") lon = -lon;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
 
   const radiusNm = parseInt(match[7], 10);
   if (radiusNm <= 0 || radiusNm > maxCircleRadiusNm) {
@@ -164,9 +188,7 @@ export function parseNotamQLineCircle(
     };
   }
 
-  const radiusKm = radiusNm * 1.852;
-  const poly = circle([lon, lat], radiusKm, { steps: 32, units: "kilometers" });
-  return poly.geometry;
+  return createNmCircleGeometry(lon, lat, radiusNm);
 }
 
 /**
@@ -174,10 +196,10 @@ export function parseNotamQLineCircle(
  */
 export function parseNgaCancelTimestamp(
   rawText: string,
-  fallbackYear?: number
+  issuedAt = Math.floor(Date.now() / 1000)
 ): number | null {
   const match =
-    /CANCEL\s+THIS\s+MSG\s+(\d{2})(\d{2})(\d{2})Z\s+([A-Z]{3})(?:\s+(\d{2,4}))?/i.exec(
+    /CANCEL\s+THIS\s+(?:MSG|MESSAGE)\s+(\d{2})(\d{2})(\d{2})\s*(?:Z|UTC)\s+([A-Z]{3})\b(?:\s+(\d{4}|\d{2})\b)?/i.exec(
       rawText
     );
   if (!match) return null;
@@ -186,9 +208,7 @@ export function parseNgaCancelTimestamp(
   const hour = parseInt(match[2], 10);
   const minute = parseInt(match[3], 10);
   const monthStr = match[4].toUpperCase();
-  const yrRaw = match[5]
-    ? parseInt(match[5], 10)
-    : fallbackYear ?? new Date().getUTCFullYear();
+  const yrRaw = match[5] ? Number(match[5]) : new Date(issuedAt * 1000).getUTCFullYear();
   const year = yrRaw < 100 ? 2000 + yrRaw : yrRaw;
 
   const months: Record<string, number> = {
@@ -206,9 +226,14 @@ export function parseNgaCancelTimestamp(
     DEC: 11,
   };
   const month = months[monthStr];
-  if (month === undefined) return null;
+  if (month === undefined || day < 1 || hour > 23 || minute > 59) return null;
 
-  return Math.floor(Date.UTC(year, month, day, hour, minute, 0) / 1000);
+  const date = new Date(Date.UTC(year, month, day, hour, minute));
+  if (date.getUTCDate() !== day) return null;
+  if (!match[5] && date.getTime() / 1000 < issuedAt - 180 * 86400) {
+    date.setUTCFullYear(year + 1);
+  }
+  return Math.floor(date.getTime() / 1000);
 }
 
 /**
@@ -226,7 +251,13 @@ export function createNmCircleGeometry(
     };
   }
   const radiusKm = radiusNm * 1.852;
-  return circle([lon, lat], radiusKm, { steps: 32, units: "kilometers" }).geometry;
+  const geometry = circle([lon, lat], radiusKm, { steps: 32, units: "kilometers" }).geometry;
+  return {
+    type: "Polygon",
+    coordinates: geometry.coordinates.map((ring) =>
+      ring.map(([x, y]) => [Number(x.toFixed(6)), Number(y.toFixed(6))])
+    ),
+  };
 }
 
 function toRad(deg: number): number {

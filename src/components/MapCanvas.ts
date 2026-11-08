@@ -4,6 +4,7 @@ import {
   NavigationControl,
   Popup,
   setWorkerUrl,
+  type GeoJSONSource,
   type MapGeoJSONFeature,
   type MapMouseEvent,
 } from "maplibre-gl";
@@ -22,6 +23,8 @@ setWorkerUrl(new URL(maplibreWorkerUrl, window.location.href).href);
 
 const DEFAULT_REPO_FEED =
   "https://raw.githubusercontent.com/Savvyboi/skandalopetra/data-feed/alerts.geojson";
+const FEED_REFRESH_MS = 15 * 60_000;
+const REQUEST_TIMEOUT_MS = 10_000;
 
 const HAZARD_LAYERS = [
   "hazards-points",
@@ -49,9 +52,10 @@ export interface SelectedMapHazard {
 }
 
 export interface MapCanvasCallbacks {
-  onSelectFeature: (selection: SelectedMapHazard) => void;
+  onSelectFeature: (selections: SelectedMapHazard[]) => void;
   onDataLoaded: (collection: HazardFeatureCollection) => void;
   onDataError?: (message: string) => void;
+  onBasemapUnavailable?: () => void;
 }
 
 export function applyMapFilters(
@@ -175,7 +179,9 @@ export function applyMapFilters(
   ]);
 }
 
-async function fetchHazardCollection(): Promise<HazardFeatureCollection> {
+async function fetchHazardCollection(
+  minimumGeneratedAt: number
+): Promise<HazardFeatureCollection> {
   const configuredUrl = import.meta.env.VITE_DATA_FEED_URL?.trim();
   const candidates = Array.from(
     new Set(
@@ -188,19 +194,20 @@ async function fetchHazardCollection(): Promise<HazardFeatureCollection> {
     )
   );
 
-  const cacheBucket = Math.floor(Date.now() / 60000);
   for (const url of candidates) {
     try {
-      const bustUrl = url.startsWith("http")
-        ? `${url}${url.includes("?") ? "&" : "?"}t=${cacheBucket}`
-        : url;
-      const res = await fetch(bustUrl);
+      const res = await fetch(url, {
+        cache: "no-cache",
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
       if (!res.ok) continue;
       const json = (await res.json()) as HazardFeatureCollection;
       if (
         json &&
         json.type === "FeatureCollection" &&
-        Array.isArray(json.features)
+        Array.isArray(json.features) &&
+        Number.isFinite(json.metadata?.generatedAt) &&
+        json.metadata.generatedAt >= minimumGeneratedAt
       ) {
         return json;
       }
@@ -233,6 +240,9 @@ function normalizeFeatureProperties(
     region: (raw.region as AlertFeatureProperties["region"]) ?? "High Seas",
     areaSqKm: Number(raw.areaSqKm ?? 0),
     durationHours: Number(raw.durationHours ?? 0),
+    sourceUrl: typeof raw.sourceUrl === "string" ? raw.sourceUrl : undefined,
+    geometryNote:
+      typeof raw.geometryNote === "string" ? raw.geometryNote : undefined,
     issuedAt: Number(raw.issuedAt ?? 0),
     validFrom: Number(raw.validFrom ?? 0),
     validTo: Number(raw.validTo ?? 0),
@@ -251,23 +261,27 @@ function normalizeFeatureProperties(
  * Prioritizes Point features first, then LineStrings, then smaller Polygons before huge regional boxes
  * so hovering/clicking an overlapping pinpoint hazard never gets blocked by a large background polygon.
  */
-function pickMostSpecificHit(hits: MapGeoJSONFeature[]): MapGeoJSONFeature {
-  if (hits.length <= 1) return hits[0];
-  const sorted = [...hits].sort((a, b) => {
-    const rankGeom = (t: string) =>
-      t === "Point" || t === "MultiPoint"
-        ? 0
-        : t === "LineString" || t === "MultiLineString"
-        ? 1
-        : 2;
-    const ra = rankGeom(a.geometry.type);
-    const rb = rankGeom(b.geometry.type);
-    if (ra !== rb) return ra - rb;
-    const areaA = Number(a.properties?.areaSqKm ?? 0);
-    const areaB = Number(b.properties?.areaSqKm ?? 0);
-    return areaA - areaB;
-  });
-  return sorted[0];
+function geometryRank(type: string): number {
+  if (type === "Point" || type === "MultiPoint") return 0;
+  if (type === "LineString" || type === "MultiLineString") return 1;
+  return 2;
+}
+
+function compareSpecificity(a: MapGeoJSONFeature, b: MapGeoJSONFeature): number {
+  return (
+    geometryRank(a.geometry.type) - geometryRank(b.geometry.type) ||
+    Number(a.properties?.areaSqKm ?? 0) - Number(b.properties?.areaSqKm ?? 0)
+  );
+}
+
+function pickMostSpecificHit(
+  hits: MapGeoJSONFeature[]
+): MapGeoJSONFeature | undefined {
+  let best: MapGeoJSONFeature | undefined;
+  for (const hit of hits) {
+    if (!best || compareSpecificity(hit, best) < 0) best = hit;
+  }
+  return best;
 }
 
 export function initMapCanvas(
@@ -295,6 +309,22 @@ export function initMapCanvas(
     attributionControl: false,
   });
 
+  function useFallbackBasemap(): void {
+    stopBasemapWatch();
+    callbacks.onBasemapUnavailable?.();
+    map.setStyle({
+      version: 8,
+      sources: {},
+      layers: [{ id: "background", type: "background", paint: { "background-color": "#090d16" } }],
+    }, { diff: false });
+  }
+  const basemapTimer = window.setTimeout(useFallbackBasemap, REQUEST_TIMEOUT_MS);
+  function stopBasemapWatch(): void {
+    window.clearTimeout(basemapTimer);
+    map.off("error", useFallbackBasemap);
+  }
+  map.on("error", useFallbackBasemap);
+
   Object.defineProperty(container, "__maplibreMap", {
     value: map,
     configurable: true,
@@ -311,36 +341,72 @@ export function initMapCanvas(
     closeOnClick: false,
     maxWidth: "300px",
     offset: 12,
+    focusAfterOpen: false,
     className: "hazard-hover-popup",
   });
+  const tooltipEl = document.createElement("div");
+  tooltipEl.className = "hover-tooltip-body";
+  const tooltipMeta = document.createElement("div");
+  tooltipMeta.className = "hover-tooltip-meta";
+  const tooltipTitle = document.createElement("div");
+  tooltipTitle.className = "hover-tooltip-title";
+  tooltipEl.append(tooltipMeta, tooltipTitle);
+  hoverPopup.setDOMContent(tooltipEl);
+  let hoveredId: string | undefined;
+  let hoverFrame = 0;
+  let pendingHover: MapMouseEvent | undefined;
 
-  const dataPromise = fetchHazardCollection()
-    .then((collection) => {
-      callbacks.onDataLoaded(collection);
-      return collection;
-    })
-    .catch((err) => {
-      const msg =
-        err instanceof Error ? err.message : "Failed to fetch hazard data.";
-      callbacks.onDataError?.(msg);
-      const empty: HazardFeatureCollection = {
-        type: "FeatureCollection",
-        metadata: {
-          generatedAt: Math.floor(Date.now() / 1000),
-          totalFeatures: 0,
-        },
-        features: [],
-      };
-      return empty;
-    });
+  function clearHover(): void {
+    window.cancelAnimationFrame(hoverFrame);
+    hoverFrame = 0;
+    pendingHover = undefined;
+    hoveredId = undefined;
+    map.getCanvas().style.cursor = "";
+    if (hoverPopup.isOpen()) hoverPopup.remove();
+  }
 
-  map.on("load", async () => {
-    map.resize();
-    const collection = await dataPromise;
+  let collection: HazardFeatureCollection | undefined;
+  let refreshing = false;
+  let lastAttemptAt = 0;
+  async function refreshFeed(): Promise<void> {
+    if (refreshing || Date.now() - lastAttemptAt < FEED_REFRESH_MS) return;
+    refreshing = true;
+    lastAttemptAt = Date.now();
+    try {
+      const previous = collection;
+      const next = await fetchHazardCollection(previous?.metadata.generatedAt ?? 0);
+      if (previous?.metadata.generatedAt !== next.metadata.generatedAt) {
+        collection = next;
+        clearHover();
+        map.getSource<GeoJSONSource>("hazards")?.setData(next);
+      }
+      callbacks.onDataLoaded(collection ?? next);
+    } catch (err) {
+      callbacks.onDataError?.(
+        err instanceof Error ? err.message : "Failed to fetch hazard data."
+      );
+    } finally {
+      refreshing = false;
+    }
+  }
+  const refreshWhenVisible = () => {
+    if (!document.hidden) void refreshFeed();
+  };
+  const feedTimer = window.setInterval(refreshWhenVisible, 60_000);
+  document.addEventListener("visibilitychange", refreshWhenVisible);
+  map.on("remove", () => {
+    clearHover();
+    stopBasemapWatch();
+    window.clearInterval(feedTimer);
+    document.removeEventListener("visibilitychange", refreshWhenVisible);
+  });
+  void refreshFeed();
 
+  map.once("style.load", () => {
+    stopBasemapWatch();
     map.addSource("hazards", {
       type: "geojson",
-      data: collection,
+      data: collection ?? { type: "FeatureCollection", features: [] },
     });
 
     map.addLayer({
@@ -444,65 +510,63 @@ export function initMapCanvas(
     applyMapFilters(map, latestCriteria);
 
     map.on("mousemove", (e: MapMouseEvent) => {
-      const hits = map.queryRenderedFeatures(e.point, {
-        layers: [...HAZARD_LAYERS],
+      pendingHover = e;
+      if (hoverFrame) return;
+      hoverFrame = window.requestAnimationFrame(() => {
+        hoverFrame = 0;
+        const event = pendingHover;
+        if (!event) return;
+        const topHit = pickMostSpecificHit(
+          map.queryRenderedFeatures(event.point, { layers: [...HAZARD_LAYERS] })
+        );
+        if (!topHit) {
+          clearHover();
+          return;
+        }
+        const id = String(topHit.properties.id);
+        if (hoveredId !== id) {
+          const { subType, issuer, severity, title } = normalizeFeatureProperties(topHit.properties);
+          tooltipMeta.textContent = `${subType} • ${issuer} • ${severity.toUpperCase()}`;
+          tooltipTitle.textContent = title;
+          map.getCanvas().style.cursor = "pointer";
+          hoveredId = id;
+        }
+        hoverPopup.setLngLat(event.lngLat);
+        if (!hoverPopup.isOpen()) hoverPopup.addTo(map);
       });
-      if (hits.length === 0) {
-        map.getCanvas().style.cursor = "";
-        hoverPopup.remove();
-        return;
-      }
-
-      map.getCanvas().style.cursor = "pointer";
-      const topHit = pickMostSpecificHit(hits);
-      const props = normalizeFeatureProperties(
-        (topHit.properties ?? {}) as Record<string, unknown>
-      );
-
-      const tooltipEl = document.createElement("div");
-      tooltipEl.className = "hover-tooltip-body";
-
-      const badgeRow = document.createElement("div");
-      badgeRow.className = "hover-tooltip-meta";
-      badgeRow.textContent = `${props.subType} • ${props.issuer} • ${props.severity.toUpperCase()}`;
-
-      const titleEl = document.createElement("div");
-      titleEl.className = "hover-tooltip-title";
-      titleEl.textContent = props.title;
-
-      tooltipEl.append(badgeRow, titleEl);
-      hoverPopup.setLngLat(e.lngLat).setDOMContent(tooltipEl).addTo(map);
     });
 
-    map.on("mouseout", () => {
-      map.getCanvas().style.cursor = "";
-      hoverPopup.remove();
-    });
+    map.on("mouseout", clearHover);
 
-    map.on("click", (e: MapMouseEvent) => {
-      const hits = map.queryRenderedFeatures(e.point, {
+    function selectAt(
+      point: MapMouseEvent["point"],
+      location: MapMouseEvent["lngLat"]
+    ): void {
+      const hits = map.queryRenderedFeatures(point, {
         layers: [...HAZARD_LAYERS],
       });
       if (hits.length === 0) return;
-
-      const selected = pickMostSpecificHit(hits);
-      const props = normalizeFeatureProperties(
-        (selected.properties ?? {}) as Record<string, unknown>
-      );
-
-      let coords: [number, number] = [e.lngLat.lng, e.lngLat.lat];
-      if (selected.geometry.type === "Point") {
-        coords = [
-          selected.geometry.coordinates[0],
-          selected.geometry.coordinates[1],
-        ];
+      const wrapped = location.wrap();
+      const selections = new Map<string, SelectedMapHazard>();
+      for (const hit of hits.sort(compareSpecificity)) {
+        const properties = normalizeFeatureProperties(hit.properties);
+        if (selections.has(properties.id)) continue;
+        const lngLat: [number, number] = hit.geometry.type === "Point"
+          ? [hit.geometry.coordinates[0], hit.geometry.coordinates[1]]
+          : [wrapped.lng, wrapped.lat];
+        selections.set(properties.id, { properties, lngLat });
       }
+      clearHover();
+      callbacks.onSelectFeature([...selections.values()]);
+    }
 
-      hoverPopup.remove();
-      callbacks.onSelectFeature({
-        properties: props,
-        lngLat: coords,
-      });
+    map.on("click", (e: MapMouseEvent) => selectAt(e.point, e.lngLat));
+    const canvas = map.getCanvas();
+    canvas.setAttribute("aria-description", "Press Enter to inspect alerts at the map center.");
+    canvas.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      const center = map.getCenter();
+      selectAt(map.project(center), center);
     });
   });
 
@@ -515,6 +579,7 @@ export function initMapCanvas(
         subTypes: [...criteria.subTypes],
         severities: [...criteria.severities],
       };
+      if (hoverPopup.isOpen() || hoverFrame) clearHover();
       applyMapFilters(map, latestCriteria);
     },
   };

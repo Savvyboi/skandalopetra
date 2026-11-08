@@ -13,6 +13,8 @@ import { resolveIcaoMetadata } from "../utils/icaoRegions.ts";
 
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const FAA_REQUEST_INTERVAL_MS = 750;
+const FAA_MAX_PAGES_PER_BATCH = 5;
 
 interface FaaSearchNotamItem {
   facilityDesignator?: string;
@@ -33,13 +35,13 @@ interface FaaSearchNotamItem {
 interface FaaSearchResponse {
   notamList?: FaaSearchNotamItem[];
   totalNotamCount?: number;
+  filteredResultCount?: number;
   error?: string;
 }
 
 /**
- * 10 balanced global Flight Information Region (FIR) & international hub batches,
- * interleaved across all continents so sequential polite polling (750ms spacing)
- * never trips Akamai burst limits and covers every global region evenly.
+ * Poll the first page of every Flight Information Region (FIR) batch before
+ * returning for more pages, so one busy region cannot use the whole run budget.
  */
 const GLOBAL_FIR_BATCHES: Array<{ name: string; designators: string }> = [
   {
@@ -181,8 +183,9 @@ function parseIcaoTenDigitTimestamp(yyMMddHHmm: string): number | null {
   const day = parseInt(yyMMddHHmm.slice(4, 6), 10);
   const hour = parseInt(yyMMddHHmm.slice(6, 8), 10);
   const min = parseInt(yyMMddHHmm.slice(8, 10), 10);
-  if (month < 0 || month > 11 || day < 1 || day > 31) return null;
-  return Math.floor(Date.UTC(year, month, day, hour, min, 0) / 1000);
+  if (month < 0 || month > 11 || day < 1 || hour > 23 || min > 59) return null;
+  const date = new Date(Date.UTC(year, month, day, hour, min));
+  return date.getUTCDate() === day ? Math.floor(date.getTime() / 1000) : null;
 }
 
 function approxDistKm(a: [number, number], b: [number, number]): number {
@@ -205,6 +208,7 @@ function parseQCenterLonLat(qCoord8Or11: string): [number, number] | null {
     qCoord8Or11.trim()
   );
   if (!m) return null;
+  if (Number(m[2]) >= 60 || Number(m[5]) >= 60) return null;
   let lat = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
   if (m[3] === "S") lat = -lat;
   let lon = parseInt(m[4], 10) + parseInt(m[5], 10) / 60;
@@ -217,7 +221,7 @@ function buildNotamGeometry(
   icaoMessage: string,
   qToken: string | null,
   qRadiusNm: number
-): Geometry | null {
+): { geometry: Geometry; geometryNote?: string } | null {
   const bodyE = extractBodySectionE(icaoMessage);
   const qCenter = qToken ? parseQCenterLonLat(qToken) : null;
 
@@ -236,9 +240,8 @@ function buildNotamGeometry(
       )
     : candidateCoords;
 
-  if (filteredCoords.length >= 3) {
-    return coordsToGeoJsonGeometry(filteredCoords);
-  }
+  const bodyGeometry = coordsToGeoJsonGeometry(filteredCoords);
+  if (bodyGeometry?.type === "Polygon") return { geometry: bodyGeometry };
 
   // 2. Check for explicit circle radius in Section E ("RADIUS 5NM", "RADIUS OF 10 NM", "WI 3NM OF")
   const radMatch =
@@ -256,20 +259,22 @@ function buildNotamGeometry(
   ) {
     const center = filteredCoords[0] ?? qCenter;
     if (center) {
-      return createNmCircleGeometry(center[0], center[1], explicitRadiusNm);
+      return { geometry: createNmCircleGeometry(center[0], center[1], explicitRadiusNm) };
     }
   }
 
   // 3. Fall back to ICAO Q-line circle (capped at 150 NM so whole-FIR 999 NM notices become clean Points)
   if (qToken) {
-    return parseNotamQLineCircle(qToken, 150);
+    const geometry = parseNotamQLineCircle(qToken, 150);
+    if (geometry) return {
+      geometry,
+      geometryNote: geometry.type === "Point"
+        ? "Representative ICAO Q-line location. See the bulletin for the actual footprint."
+        : "Approximate bounding circle from the ICAO Q-line. See the bulletin for the actual footprint.",
+    };
   }
 
-  if (filteredCoords.length > 0) {
-    return coordsToGeoJsonGeometry(filteredCoords);
-  }
-
-  return null;
+  return bodyGeometry ? { geometry: bodyGeometry } : null;
 }
 
 interface NavCanadaAlphaItem {
@@ -294,11 +299,12 @@ async function fetchNavCanadaItems(): Promise<FaaSearchNotamItem[]> {
         signal: AbortSignal.timeout(18000),
       }
     );
-    if (!res.ok) return [];
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const payload = (await res.json()) as { data?: NavCanadaAlphaItem[] };
+    if (!Array.isArray(payload?.data)) throw new Error("Unrecognized NOTAM response");
     const out: FaaSearchNotamItem[] = [];
 
-    for (const row of payload.data ?? []) {
+    for (const row of payload.data) {
       let rawIcao = "";
       if (row.text) {
         try {
@@ -327,12 +333,13 @@ async function fetchNavCanadaItems(): Promise<FaaSearchNotamItem[]> {
         notamNumber: numMatch?.[1] ?? (row.pk ? `NC-${row.pk}` : ""),
         issueDate: row.startValidity ?? undefined,
         startDate: row.startValidity ?? undefined,
-        endDate: row.endValidity ?? "PERM",
+        endDate: row.endValidity ?? undefined,
         icaoMessage: cleaned,
       });
     }
     return out;
-  } catch {
+  } catch (err) {
+    console.warn("[globalNotam] NAV CANADA source failed:", err instanceof Error ? err.message : err);
     return [];
   }
 }
@@ -340,7 +347,8 @@ async function fetchNavCanadaItems(): Promise<FaaSearchNotamItem[]> {
 async function fetchSearchPage(
   designators: string,
   offset: number,
-  cookieHeader: string
+  cookieHeader: string,
+  deadline: AbortSignal
 ): Promise<{ status: number; data: FaaSearchResponse | null }> {
   try {
     const body = new URLSearchParams({
@@ -363,7 +371,7 @@ async function fetchSearchPage(
         ...(cookieHeader ? { Cookie: cookieHeader } : {}),
       },
       body: body.toString(),
-      signal: AbortSignal.timeout(18000),
+      signal: AbortSignal.any([AbortSignal.timeout(18000), deadline]),
     });
 
     if (!res.ok) return { status: res.status, data: null };
@@ -378,6 +386,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function fetchFaaGlobalBatches(): Promise<FaaSearchNotamItem[]> {
+  const deadline = AbortSignal.timeout(90000);
   let cookieHeader = "";
   try {
     const init = await fetch(
@@ -388,12 +397,12 @@ async function fetchFaaGlobalBatches(): Promise<FaaSearchNotamItem[]> {
           Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
           "Accept-Language": "en-US,en;q=0.9",
         },
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.any([AbortSignal.timeout(10000), deadline]),
       }
     );
-    if (init.status === 403) {
+    if (init.status === 403 || init.status === 429) {
       console.warn(
-        "[globalNotam] FAA notamSearch edge rate-limit cooldown active (HTTP 403); retaining cached global NOTAMs + NAV CANADA live feed"
+        `[globalNotam] FAA NOTAM Search HTTP ${init.status}; retaining cached records`
       );
       return [];
     }
@@ -407,29 +416,63 @@ async function fetchFaaGlobalBatches(): Promise<FaaSearchNotamItem[]> {
   }
 
   const allItems: FaaSearchNotamItem[] = [];
-  for (let i = 0; i < GLOBAL_FIR_BATCHES.length; i++) {
-    if (i > 0) await sleep(750);
-    const batch = GLOBAL_FIR_BATCHES[i];
-    const { status, data } = await fetchSearchPage(
-      batch.designators,
-      0,
-      cookieHeader
-    );
-    if (status === 403) {
-      console.warn(
-        `[globalNotam] FAA notamSearch rate limit reached at batch ${i + 1}/${GLOBAL_FIR_BATCHES.length} (${batch.name}); stopping further pages cleanly`
+  let pending = GLOBAL_FIR_BATCHES.map((batch) => ({
+    ...batch,
+    offset: 0,
+    total: 0,
+    lastPageKey: "",
+  }));
+  let requestCount = 0;
+  for (let page = 0; page < FAA_MAX_PAGES_PER_BATCH && pending.length > 0; page++) {
+    const next = [];
+    for (const batch of pending) {
+      if (requestCount > 0) await sleep(FAA_REQUEST_INTERVAL_MS);
+      if (deadline.aborted) {
+        console.warn("[globalNotam] FAA NOTAM Search exceeded its run budget; retaining cached records");
+        return allItems;
+      }
+      requestCount++;
+      const { status, data } = await fetchSearchPage(
+        batch.designators, batch.offset, cookieHeader, deadline
       );
-      break;
+      if (status === 403 || status === 429) {
+        console.warn(`[globalNotam] FAA NOTAM Search HTTP ${status} for ${batch.name}; stopping further requests`);
+        return allItems;
+      }
+      if (!Array.isArray(data?.notamList) || data.error) {
+        console.warn(`[globalNotam] FAA NOTAM Search did not return a page for ${batch.name} (HTTP ${status || "unavailable"})`);
+        continue;
+      }
+      const items = data.notamList;
+      if (items.length === 0) continue;
+      const pageKey = JSON.stringify(items.map((item) => [item.icaoId, item.notamNumber, item.issueDate]));
+      if (pageKey === batch.lastPageKey) {
+        console.warn(`[globalNotam] FAA NOTAM Search repeated a page for ${batch.name} at offset ${batch.offset}`);
+        continue;
+      }
+      allItems.push(...items);
+      const offset = batch.offset + items.length;
+      const total = Number(data.filteredResultCount || data.totalNotamCount);
+      if (offset < total) {
+        next.push({ ...batch, offset, total, lastPageKey: pageKey });
+      }
     }
-    if (data?.notamList?.length) {
-      allItems.push(...data.notamList);
-    }
+    pending = next;
+  }
+  if (pending.length > 0) {
+    const partialCoverage = pending.map((batch) => `${batch.name} ${batch.offset}/${batch.total}`).join(", ");
+    console.warn(`[globalNotam] FAA NOTAM Search page limit reached (records received/available): ${partialCoverage}`);
   }
   return allItems;
 }
 
+function icaoNotamId(icaoLocation: string, number: string): string {
+  return `ICAO-NOTAM-${icaoLocation}-${number.replace(/[^A-Z0-9-]/g, "-")}`;
+}
+
 export async function fetchGlobalIcaoNotams(
-  nowSec: number
+  nowSec: number,
+  onExpiry?: (id: string, expiresAt: number) => void
 ): Promise<HazardFeature[]> {
   const seenKeys = new Set<string>();
   const features: HazardFeature[] = [];
@@ -438,13 +481,15 @@ export async function fetchGlobalIcaoNotams(
     fetchNavCanadaItems(),
     fetchFaaGlobalBatches(),
   ]);
+  console.log(`[globalNotam] Received ${faaGlobalItems.length} FAA Search and ${navCanadaItems.length} NAV CANADA notices before filtering`);
 
-  const batchItems = [navCanadaItems, faaGlobalItems];
+  const batches = [
+    { items: navCanadaItems, sourceUrl: "https://plan.navcanada.ca/wxrecall/" },
+    { items: faaGlobalItems, sourceUrl: "https://notams.aim.faa.gov/notamSearch/" },
+  ];
 
-  for (const list of batchItems) {
-    for (const item of list) {
-      if (item.cancelledOrExpired) continue;
-
+  for (const { items, sourceUrl } of batches) {
+    for (const item of items) {
       const icaoLocation = (
         item.icaoId ||
         item.facilityDesignator ||
@@ -460,7 +505,25 @@ export async function fetchGlobalIcaoNotams(
         ""
       ).trim();
 
-      if (!icaoLocation || !rawMsg) continue;
+      if (!icaoLocation) continue;
+      if (item.cancelledOrExpired) {
+        if (notamNumber) {
+          const end = parseFaaNotamSearchDate(item.endDate, nowSec);
+          onExpiry?.(icaoNotamId(icaoLocation, notamNumber), Math.min(end, nowSec));
+        }
+        continue;
+      }
+      if (!rawMsg) continue;
+
+      const change = /^\s*\(?\s*[A-Z]\d{4}\/\d{2}\s+NOTAM([RC])\s+([A-Z]\d{4}\/\d{2})\b/i.exec(rawMsg);
+      if (change) {
+        const start = /\bB\)\s*(\d{10})\b/.exec(rawMsg);
+        const changedAt = parseFaaNotamSearchDate(
+          item.issueDate, (start && parseIcaoTenDigitTimestamp(start[1])) || nowSec
+        );
+        onExpiry?.(icaoNotamId(icaoLocation, change[2].toUpperCase()), Math.min(changedAt, nowSec));
+      }
+      if (change?.[1].toUpperCase() === "C") continue;
 
       const dedupKey = `${icaoLocation}-${notamNumber || rawMsg.slice(0, 48)}`;
       if (seenKeys.has(dedupKey)) continue;
@@ -479,8 +542,9 @@ export async function fetchGlobalIcaoNotams(
       const qToken = qMatch?.[5] ?? null;
       const qRadiusNm = qMatch ? parseInt(qMatch[6], 10) : 0;
 
-      const geometry = buildNotamGeometry(rawMsg, qToken, qRadiusNm);
-      if (!geometry) continue;
+      const footprint = buildNotamGeometry(rawMsg, qToken, qRadiusNm);
+      if (!footprint) continue;
+      const { geometry, geometryNote } = footprint;
 
       // Parse B) and C) 10-digit ICAO timestamps if present, else startDate/endDate
       const bMatch = /\bB\)\s*(\d{10})\b/.exec(rawMsg);
@@ -492,26 +556,22 @@ export async function fetchGlobalIcaoNotams(
         parseFaaNotamSearchDate(item.startDate, issuedAt);
 
       let validTo: number;
-      if (cMatch?.[1] === "PERM" || item.endDate?.trim().toUpperCase() === "PERM") {
-        validTo = nowSec + 14 * 86400;
+      if (cMatch?.[1] === "PERM" || (!cMatch && item.endDate?.trim().toUpperCase() === "PERM")) {
+        validTo = Math.max(nowSec, validFrom) + 14 * 86400;
       } else {
         validTo =
           (cMatch ? parseIcaoTenDigitTimestamp(cMatch[1]) : null) ??
-          parseFaaNotamSearchDate(item.endDate, nowSec + 7 * 86400);
+          parseFaaNotamSearchDate(item.endDate, Math.max(nowSec, validFrom) + 7 * 86400);
       }
-      if (validTo <= validFrom) {
-        validTo = Math.max(validFrom + 3600, nowSec + 24 * 3600);
-      }
+      if (validTo <= validFrom) continue;
 
       const altitudeMinFt =
         lowerFl !== undefined && Number.isFinite(lowerFl)
           ? lowerFl * 100
           : undefined;
       const altitudeMaxFt =
-        upperFl !== undefined && Number.isFinite(upperFl)
-          ? upperFl >= 999
-            ? 60000
-            : upperFl * 100
+        upperFl !== undefined && Number.isFinite(upperFl) && upperFl < 999
+          ? upperFl * 100
           : undefined;
 
       const qCategory = describeQCode(qCode);
@@ -537,13 +597,11 @@ export async function fetchGlobalIcaoNotams(
 
       const areaSqKm = computeGeometryAreaSqKm(geometry);
       const durationHours = computeDurationHours(validFrom, validTo);
-      const safeNum = (notamNumber || String(validFrom)).replace(/[^A-Z0-9-]/g, "-");
-
       features.push({
         type: "Feature",
         geometry,
         properties: {
-          id: `ICAO-NOTAM-${icaoLocation}-${safeNum}`,
+          id: icaoNotamId(icaoLocation, notamNumber || String(validFrom)),
           domain: "notam",
           subType: "NOTAM",
           severity,
@@ -560,6 +618,8 @@ export async function fetchGlobalIcaoNotams(
           issuedAt,
           validFrom,
           validTo,
+          sourceUrl,
+          ...(geometryNote ? { geometryNote } : {}),
           ...(altitudeMinFt !== undefined ? { altitudeMinFt } : {}),
           ...(altitudeMaxFt !== undefined ? { altitudeMaxFt } : {}),
         },
@@ -568,7 +628,7 @@ export async function fetchGlobalIcaoNotams(
   }
 
   console.log(
-    `[globalNotam] Parsed ${features.length} global ICAO NOTAMs across ${GLOBAL_FIR_BATCHES.length} worldwide FIR regions`
+    `[globalNotam] Parsed ${features.length} mappable ICAO NOTAMs`
   );
   return features;
 }

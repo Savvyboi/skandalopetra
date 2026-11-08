@@ -7,11 +7,16 @@ on:
     branches: ["main"]
     paths:
       - "scripts/**"
+      - "src/types/schema.ts"
       - ".github/workflows/ingest-data.yml"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: data-feed
+  cancel-in-progress: false
 
 jobs:
   ingest:
@@ -29,10 +34,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Read the current data-feed archive
+        run: |
+          if git ls-remote --exit-code --heads origin refs/heads/data-feed; then
+            git fetch --depth=1 origin refs/heads/data-feed
+            mkdir -p dist-data
+            git show FETCH_HEAD:alerts.geojson > dist-data/alerts.geojson
+          else
+            status=$?
+            if [ "$status" -ne 2 ]; then
+              exit "$status"
+            fi
+            echo 'Data-feed branch does not exist yet.'
+          fi
+
       - name: Run ingestion and archive merger
         env:
+          ARCHIVE_FROM_CHECKOUT: 'true'
           FAA_CLIENT_ID: ${{ secrets.FAA_CLIENT_ID }}
           FAA_CLIENT_SECRET: ${{ secrets.FAA_CLIENT_SECRET }}
+          DECEA_API_KEY: ${{ secrets.DECEA_API_KEY }}
+          DECEA_API_PASS: ${{ secrets.DECEA_API_PASS }}
           REPO_OWNER_AND_NAME: ${{ github.repository }}
         run: npx tsx scripts/ingest.ts
 

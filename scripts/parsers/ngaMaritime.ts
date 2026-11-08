@@ -29,6 +29,14 @@ const FETCH_HEADERS = {
 const DANGER_REGEX =
   /HAZARDOUS|ROCKET|MISSILE|SPACE\s+DEBRIS|GUNNERY|FIRING|LIVE\s+FIRE|MINE|DERELICT|PIRACY|TSUNAMI|UNEXPLODED|ORDNANCE|HURRICANE|TYPHOON|CYCLONE|STORM\s+WARNING/i;
 
+const MONTHS = "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split(" ");
+
+function utcTime(year: number, month: number, day: number, hour: number, minute: number): number | null {
+  if (month < 0 || day < 1 || hour > 23 || minute > 59) return null;
+  const date = new Date(Date.UTC(year, month, day, hour, minute));
+  return date.getUTCDate() === day ? Math.floor(date.getTime() / 1000) : null;
+}
+
 const ARABIC_TO_ROMAN: Record<string, string> = {
   "1": "I",
   "2": "II",
@@ -139,24 +147,7 @@ function parseMaritimeIssueDate(raw: unknown, fallbackSec: number): number {
     const monStr = milMatch[4].toUpperCase();
     const yrRaw = parseInt(milMatch[5], 10);
     const year = yrRaw < 100 ? 2000 + yrRaw : yrRaw;
-    const months: Record<string, number> = {
-      JAN: 0,
-      FEB: 1,
-      MAR: 2,
-      APR: 3,
-      MAY: 4,
-      JUN: 5,
-      JUL: 6,
-      AUG: 7,
-      SEP: 8,
-      OCT: 9,
-      NOV: 10,
-      DEC: 11,
-    };
-    const month = months[monStr];
-    if (month !== undefined) {
-      return Math.floor(Date.UTC(year, month, day, hour, minute, 0) / 1000);
-    }
+    return utcTime(year, MONTHS.indexOf(monStr), day, hour, minute) ?? fallbackSec;
   }
 
   // Format: YYYY/MM/DD HH UTC (JCG)
@@ -217,6 +208,27 @@ function parseCompactMarineCoords(text: string): [number, number][] {
   return coords;
 }
 
+function marineWarningGeometry(coords: [number, number][]): Geometry | null {
+  const closedAreas: [number, number][][][] = [];
+  const starts = new Map<string, number>();
+  for (const [index, point] of coords.entries()) {
+    const key = point.join(",");
+    const start = starts.get(key);
+    if (start !== undefined && index - start >= 3) {
+      const ring = coordsToGeoJsonGeometry(coords.slice(start, index + 1));
+      if (ring?.type === "Polygon") {
+        closedAreas.push([ring.coordinates[0] as [number, number][]]);
+        starts.clear();
+        continue;
+      }
+    }
+    if (start === undefined) starts.set(key, index);
+  }
+  if (closedAreas.length === 0) return coordsToGeoJsonGeometry(coords);
+  if (closedAreas.length === 1) return { type: "Polygon", coordinates: closedAreas[0] };
+  return { type: "MultiPolygon", coordinates: closedAreas };
+}
+
 function buildFeature(params: {
   id: string;
   subType: HazardSubType;
@@ -231,6 +243,8 @@ function buildFeature(params: {
   issuedAt: number;
   validFrom: number;
   validTo: number;
+  sourceUrl?: string;
+  geometryNote?: string;
 }): HazardFeature {
   return {
     type: "Feature",
@@ -251,6 +265,8 @@ function buildFeature(params: {
       issuedAt: params.issuedAt,
       validFrom: params.validFrom,
       validTo: params.validTo,
+      ...(params.sourceUrl ? { sourceUrl: params.sourceUrl } : {}),
+      ...(params.geometryNote ? { geometryNote: params.geometryNote } : {}),
     },
   };
 }
@@ -266,9 +282,12 @@ interface NgaBroadcastWarning {
   issueDate?: string;
 }
 
+type SnapshotHandler = (idPrefix: string, activeIds: ReadonlySet<string>) => void;
+
 async function fetchNgaMsiBroadcasts(
   nowSec: number,
-  boundaries: Map<string, Geometry>
+  boundaries: Map<string, Geometry>,
+  onSnapshot?: SnapshotHandler
 ): Promise<HazardFeature[]> {
   const url =
     "https://msi.nga.mil/api/publications/broadcast-warn?output=json&status=active";
@@ -276,49 +295,59 @@ async function fetchNgaMsiBroadcasts(
     headers: FETCH_HEADERS,
     signal: AbortSignal.timeout(20000),
   });
-  if (!res.ok) {
-    console.warn(`[ngaMaritime] NGA MSI HTTP ${res.status}`);
-    return [];
-  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
   const payload = (await res.json()) as
     | NgaBroadcastWarning[]
-    | { "broadcast-warn"?: NgaBroadcastWarning[] };
-  const warnings = Array.isArray(payload)
-    ? payload
-    : Array.isArray(payload["broadcast-warn"])
-    ? payload["broadcast-warn"]
-    : [];
+    | { "broadcast-warn"?: NgaBroadcastWarning[] }
+    | null;
+  const warnings = Array.isArray(payload) ? payload : payload?.["broadcast-warn"];
+  if (!Array.isArray(warnings)) {
+    throw new Error("Unrecognized NGA MSI active warning response");
+  }
 
   const results: HazardFeature[] = [];
+  const activeIds = new Set<string>();
+  let completeSnapshot = true;
   for (const w of warnings) {
-    const rawText = String(w.text ?? "").trim();
-    if (!rawText || /WARNINGS\s+IN\s+FORCE/i.test(rawText)) continue;
-
-    const navArea = normalizeNavAreaCode(w.navArea || "IV");
+    const rawText = String(w?.text ?? "").trim();
+    const areaCode = String(w?.navArea ?? "").trim().toUpperCase();
+    const navArea = normalizeNavAreaCode(areaCode);
+    if (!navArea || !rawText) {
+      completeSnapshot = false;
+      continue;
+    }
+    if (/WARNINGS\s+IN\s+FORCE/i.test(rawText)) continue;
     const msgYear = String(
       w.msgYear ?? new Date(nowSec * 1000).getUTCFullYear()
     );
     const msgNumber = String(w.msgNumber ?? Math.abs(hashCode(rawText)));
+    if (w.msgYear == null || w.msgNumber == null) completeSnapshot = false;
+    const series = /^(?:A|HYDROLANT)$/.test(areaCode) ? "HYDROLANT"
+      : /^(?:P|HYDROPAC)$/.test(areaCode) ? "HYDROPAC"
+      : /^(?:C|HYDROARC)$/.test(areaCode) ? "HYDROARC"
+      : navArea;
+    const id = `NGA-NAVAREA-${series}-${msgYear}-${msgNumber}`;
+    activeIds.add(id);
 
     const issuedAt = parseMaritimeIssueDate(w.issueDate, nowSec);
     const validFrom = issuedAt;
-    const cancelSec = parseNgaCancelTimestamp(rawText);
+    const cancelSec = parseNgaCancelTimestamp(rawText, issuedAt);
     const validTo =
       cancelSec && cancelSec > validFrom ? cancelSec : nowSec + 7 * 86400;
 
     const coords = parseNgaCoordinates(rawText);
-    const geometry =
-      coordsToGeoJsonGeometry(coords) ?? boundaries.get(navArea) ?? null;
+    const parsedGeometry = coordsToGeoJsonGeometry(coords);
+    const geometry = parsedGeometry ?? boundaries.get(navArea);
     if (!geometry) continue;
 
     const meta = resolveNavAreaMetadata(navArea);
     results.push(
       buildFeature({
-        id: `NGA-NAVAREA-${navArea}-${msgYear}-${msgNumber}`,
+        id,
         subType: "NAVAREA",
         severity: DANGER_REGEX.test(rawText) ? "danger" : "warning",
-        title: `NAVAREA ${navArea} Warning ${msgNumber}/${msgYear}`,
+        title: `${series === navArea ? `NAVAREA ${navArea}` : series} Warning ${msgNumber}/${msgYear}`,
         rawText,
         stationOrArea: `NAVAREA ${navArea}`,
         issuer: "NGA MSI (US)",
@@ -328,9 +357,12 @@ async function fetchNgaMsiBroadcasts(
         issuedAt,
         validFrom,
         validTo,
+        sourceUrl: "https://msi.nga.mil/NavWarnings",
+        ...(!parsedGeometry ? { geometryNote: "Approximate NAVAREA coverage. The bulletin did not supply a mappable location." } : {}),
       })
     );
   }
+  if (completeSnapshot) onSnapshot?.("NGA-NAVAREA-", activeIds);
   return results;
 }
 
@@ -392,7 +424,7 @@ async function fetchUkhoAdmiraltyWarnings(
     const isNavarea = /NAVAREA/i.test(warnType) || /NAVAREA/i.test(ref);
     const subType: HazardSubType = isNavarea ? "NAVAREA" : "NAVTEX";
     const issuedAt = parseMaritimeIssueDate(dtg, nowSec);
-    const cancelSec = parseNgaCancelTimestamp(body);
+    const cancelSec = parseNgaCancelTimestamp(body, issuedAt);
     const validTo =
       cancelSec && cancelSec > issuedAt ? cancelSec : nowSec + 7 * 86400;
 
@@ -417,6 +449,7 @@ async function fetchUkhoAdmiraltyWarnings(
         issuedAt,
         validFrom: issuedAt,
         validTo,
+        sourceUrl: url,
       })
     );
   }
@@ -533,6 +566,7 @@ async function fetchDmaNiordWarnings(nowSec: number): Promise<HazardFeature[]> {
           issuedAt,
           validFrom: issuedAt,
           validTo: validTo > issuedAt ? validTo : nowSec + 7 * 86400,
+          sourceUrl: "https://niord.dma.dk/",
         })
       );
     });
@@ -631,11 +665,9 @@ async function fetchHnhsGreeceWarnings(
     const issuedAt = !Number.isNaN(startMs)
       ? Math.floor(startMs / 1000)
       : parseMaritimeIssueDate(titleRaw, nowSec);
-    const validFrom = Math.min(issuedAt, nowSec);
-    const validTo =
-      !Number.isNaN(endMs) && Math.floor(endMs / 1000) > nowSec
-        ? Math.floor(endMs / 1000)
-        : nowSec + 7 * 86400;
+    const validFrom = issuedAt;
+    const validTo = Number.isNaN(endMs) ? Math.max(nowSec, validFrom) + 7 * 86400 : Math.floor(endMs / 1000);
+    if (validTo <= validFrom) continue;
 
     const navwarnRef =
       /\b([A-Z]{2}\d{2})\b/.exec(titleRaw)?.[1] ||
@@ -665,6 +697,7 @@ async function fetchHnhsGreeceWarnings(
         issuedAt,
         validFrom,
         validTo,
+        sourceUrl: pageUrl,
       })
     );
   }
@@ -744,7 +777,7 @@ async function fetchJcgSeries(
     if (!geometry) continue;
 
     const issuedAt = parseMaritimeIssueDate(dateStr, nowSec);
-    const cancelSec = parseNgaCancelTimestamp(bodyText, currentYear);
+    const cancelSec = parseNgaCancelTimestamp(bodyText, issuedAt);
     const validTo =
       cancelSec && cancelSec > issuedAt ? cancelSec : nowSec + 7 * 86400;
 
@@ -771,6 +804,7 @@ async function fetchJcgSeries(
         issuedAt,
         validFrom: issuedAt,
         validTo,
+        sourceUrl: "https://www1.kaiho.mlit.go.jp/TUHO/keiho/navarea11.html",
       })
     );
   }
@@ -831,7 +865,7 @@ const WMO_GLOBAL_MARINE_SOURCES: WmoMarineSource[] = [
     issuer: "NOAA NHC (US)",
     country: "East Tropical Pacific",
     region: "North America",
-    url: "https://tgftp.nws.noaa.gov/data/raw/fz/fzpn02.knhc.hsf.ep2.txt",
+    url: "https://tgftp.nws.noaa.gov/data/raw/fz/fzpn03.knhc.hsf.ep2.txt",
   },
   // South Atlantic: Brazil Navy DHN (NAVAREA V) & Argentina SHN/SMN (NAVAREA VI)
   {
@@ -921,28 +955,12 @@ const WMO_GLOBAL_MARINE_SOURCES: WmoMarineSource[] = [
     region: "Oceania",
     url: "https://tgftp.nws.noaa.gov/data/raw/ww/wwnc01.nwbb..txt",
   },
-  // NW Pacific Marine Gale/Typhoon Bulletins: JMA Japan (NAVAREA XI)
-  {
-    navArea: "XI",
-    idPrefix: "WMO-NAVAREA-XI-25",
-    issuer: "JMA Japan",
-    country: "NW Pacific",
-    region: "Asia",
-    url: "https://tgftp.nws.noaa.gov/data/raw/ww/wwjp25.rjtd..txt",
-  },
-  {
-    navArea: "XI",
-    idPrefix: "WMO-NAVAREA-XI-26",
-    issuer: "JMA Japan",
-    country: "NW Pacific",
-    region: "Asia",
-    url: "https://tgftp.nws.noaa.gov/data/raw/ww/wwjp26.rjtd..txt",
-  },
+  // JMA scheduled and emergency marine warnings. WWJP25/26 ended in 2021.
   {
     navArea: "XI",
     idPrefix: "WMO-NAVAREA-XI-27",
     issuer: "JMA Japan",
-    country: "East China & Philippine Sea",
+    country: "Northwest Pacific",
     region: "Asia",
     url: "https://tgftp.nws.noaa.gov/data/raw/ww/wwjp27.rjtd..txt",
   },
@@ -950,7 +968,7 @@ const WMO_GLOBAL_MARINE_SOURCES: WmoMarineSource[] = [
     navArea: "XI",
     idPrefix: "WMO-NAVAREA-XI-28",
     issuer: "JMA Japan",
-    country: "Sea of Okhotsk & Bering Sea",
+    country: "Northwest Pacific",
     region: "Asia",
     url: "https://tgftp.nws.noaa.gov/data/raw/ww/wwjp28.rjtd..txt",
   },
@@ -1002,19 +1020,43 @@ function resolveMarineFallbackGeometry(
   return pt ? { type: "Point", coordinates: pt } : null;
 }
 
-function isStaleBulletin(text: string, currentYear: number): boolean {
-  const years = [...text.matchAll(/\b(20\d{2})\b/g)].map((m) =>
-    parseInt(m[1], 10)
-  );
-  if (years.length === 0) return false;
-  const maxYear = Math.max(...years);
-  return maxYear < currentYear - 1;
+function resolveBulletinDayTime(dayTime: string, referenceSec: number): number | null {
+  const match = /^(\d{2})(\d{2})(\d{2})$/.exec(dayTime);
+  if (!match) return null;
+  const ref = new Date(referenceSec * 1000);
+  const candidates = [-1, 0, 1].flatMap((offset) => {
+    const monthStart = new Date(Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth() + offset, 1));
+    const timestamp = utcTime(monthStart.getUTCFullYear(), monthStart.getUTCMonth(), Number(match[1]), Number(match[2]), Number(match[3]));
+    return timestamp === null ? [] : [timestamp];
+  });
+  candidates.sort((a, b) => Math.abs(a - referenceSec) - Math.abs(b - referenceSec));
+  return candidates[0] ?? null;
+}
+
+function parseBrazilianWarningIssuedAt(text: string): number | null {
+  const match = /(?:ISSUED AT|EMITIDO [ÀA]S)\s+(\d{2})(\d{2})Z[^\n]*?(\d{1,2})\/([A-Z]{3})\/(\d{4})/i.exec(text);
+  if (!match) return null;
+  const portugueseMonth = "JAN FEV MAR ABR MAI JUN JUL AGO SET OUT NOV DEZ".split(" ");
+  const month = match[4].toUpperCase();
+  const index = MONTHS.includes(month) ? MONTHS.indexOf(month) : portugueseMonth.indexOf(month);
+  return utcTime(Number(match[5]), index, Number(match[3]), Number(match[1]), Number(match[2]));
+}
+
+function parseWmoBulletinIssuedAt(text: string, lastModified: string | null): number | null {
+  const absolute = /^\s*(\d{2})(\d{2})\s+UTC\s+(?:[A-Z]{3}\s+)?([A-Z]{3})\s+(\d{1,2})\s+(\d{4})\s*$/im.exec(text);
+  if (absolute) {
+    return utcTime(Number(absolute[5]), MONTHS.indexOf(absolute[3].toUpperCase()), Number(absolute[4]), Number(absolute[1]), Number(absolute[2]));
+  }
+  const heading = /^[A-Z]{4}\d{2}\s+[A-Z]{4}\s+(\d{6})\b/m.exec(text);
+  const reference = lastModified ? Date.parse(lastModified) / 1000 : NaN;
+  if (!heading || !Number.isFinite(reference)) return null;
+  const issuedAt = resolveBulletinDayTime(heading[1], reference);
+  return issuedAt !== null && Math.abs(issuedAt - reference) <= 2 * 86400 ? issuedAt : null;
 }
 
 async function fetchGlobalWmoMarineBulletins(
   nowSec: number
 ): Promise<HazardFeature[]> {
-  const currentYear = new Date(nowSec * 1000).getUTCFullYear();
   const features: HazardFeature[] = [];
 
   const settled = await Promise.allSettled(
@@ -1023,21 +1065,21 @@ async function fetchGlobalWmoMarineBulletins(
         headers: FETCH_HEADERS,
         signal: AbortSignal.timeout(15000),
       });
-      if (!res.ok) return [];
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const rawBulletin = (await res.text()).trim();
       if (!rawBulletin) return [];
 
-      if (isStaleBulletin(rawBulletin, currentYear)) return [];
-      if (/\b(?:NO\s+WARNINGS?|NO\s+GALE|WARNINGS?\s*:\s*NIL|\bNIL\b)\b/i.test(rawBulletin) && !/\b(?:GALE|STORM|HURRICANE|TYPHOON|CYCLONE)\s+WARNING\b/i.test(rawBulletin)) {
-        return [];
-      }
-
       const localFeatures: HazardFeature[] = [];
+      const issuedAt = parseWmoBulletinIssuedAt(rawBulletin, res.headers.get("last-modified"));
+      const dayTimeValid = /\bWARNING VALID\s+(\d{6})\b/i.exec(rawBulletin);
+      const validTo = dayTimeValid && issuedAt !== null
+        ? resolveBulletinDayTime(dayTimeValid[1], issuedAt)
+        : null;
+      const recentBulletin = issuedAt !== null && issuedAt <= nowSec + 3600 && issuedAt >= nowSec - 8 * 86400;
 
       // Case A: NOAA High Seas Forecast "...WARNING..." blocks
-      if (rawBulletin.includes(".WARNINGS.")) {
-        const warnSection =
-          rawBulletin.split(".WARNINGS.")[1]?.split(".SYNOPSIS")[0] ?? "";
+      if (rawBulletin.includes(".WARNINGS.") && recentBulletin) {
+        const warnSection = rawBulletin.split(".WARNINGS.")[1]?.split(".SYNOPSIS")[0] ?? "";
         const blocks = warnSection
           .split(/\.\.\.([A-Z\s/]+WARNING)\.\.\./g)
           .slice(1);
@@ -1046,7 +1088,8 @@ async function fetchGlobalWmoMarineBulletins(
           const body = (blocks[i + 1] ?? "").trim();
           if (!body) continue;
 
-          const firstPara = body.split(/\n\.24 HOUR FORECAST/i)[0] ?? body;
+          const firstPara = body.split(/(?:^|\n)\.\d{1,2}\s+HOUR FORECAST\b/i)[0];
+          if (!firstPara) continue;
           const ddmCoords = parseNgaCoordinates(firstPara);
           const compactCoords =
             ddmCoords.length > 0 ? ddmCoords : parseCompactMarineCoords(firstPara);
@@ -1062,7 +1105,7 @@ async function fetchGlobalWmoMarineBulletins(
             );
           } else {
             geometry =
-              coordsToGeoJsonGeometry(compactCoords) ??
+              marineWarningGeometry(compactCoords) ??
               resolveMarineFallbackGeometry(firstPara, src.navArea, false);
           }
           if (!geometry) continue;
@@ -1070,33 +1113,42 @@ async function fetchGlobalWmoMarineBulletins(
           const blockIdx = Math.floor(i / 2) + 1;
           localFeatures.push(
             buildFeature({
-              id: `${src.idPrefix}-${blockIdx}`,
-              subType: "NAVAREA",
+              id: `${src.idPrefix}-ISSUE-${issuedAt}-${blockIdx}`,
+              subType: "MARINE WEATHER",
               severity: DANGER_REGEX.test(`${heading} ${body}`)
                 ? "danger"
                 : "warning",
-              title: `NAVAREA ${src.navArea} — ${heading} #${blockIdx}`,
+              title: `METAREA ${src.navArea} — ${heading} #${blockIdx}`,
               rawText: `${heading}\n${body}`,
-              stationOrArea: `NAVAREA ${src.navArea}`,
+              stationOrArea: `METAREA ${src.navArea}`,
               issuer: src.issuer,
               country: src.country,
               region: src.region,
               geometry,
-              issuedAt: nowSec,
-              validFrom: nowSec - 3600,
-              validTo: nowSec + 36 * 3600,
+              issuedAt,
+              validFrom: issuedAt,
+              validTo: issuedAt + 6 * 3600,
+              sourceUrl: src.url,
+              geometryNote: "Approximate footprint interpreted from the marine weather bulletin.",
             })
           );
         }
         return localFeatures;
       }
 
-      // Case B: Brazilian Navy DHN "WARNING NR XXX/YYYY" blocks
-      if (/WARNING\s+NR\s+\d+\/\d{4}/i.test(rawBulletin)) {
-        const blocks = rawBulletin.split(/(?=WARNING\s+NR\s+\d+\/\d{4})/i);
+      // Case B: Brazilian Navy DHN English and Portuguese notices share warning numbers.
+      if (src.issuer === "DHN Brazil") {
+        const blocks = rawBulletin.split(/(?=^(?:WARNING|AVISO)\s+NR\s+\d+\/\d{4})/im);
         for (const blk of blocks) {
-          const nrMatch = /WARNING\s+NR\s+(\d+\/\d{4})/i.exec(blk);
+          const nrMatch = /^(?:WARNING|AVISO)\s+NR\s+(\d+\/\d{4})/i.exec(blk);
           if (!nrMatch) continue;
+          const issuedAt = parseBrazilianWarningIssuedAt(blk);
+          if (issuedAt === null || issuedAt > nowSec + 3600 || issuedAt < nowSec - 14 * 86400) continue;
+          const startTime = /(?:STARTING\s+AT|A\s+PARTIR\s+DE)\s+(\d{6})Z/i.exec(blk);
+          const endTime = /(?:VALID\s+UNTIL|V[ÁA]LIDO\s+AT[ÉE])\s+(\d{6})Z/i.exec(blk);
+          const validFrom = (startTime && resolveBulletinDayTime(startTime[1], issuedAt)) || issuedAt;
+          const validTo = endTime && resolveBulletinDayTime(endTime[1], validFrom);
+          if (!validTo || validTo <= validFrom || validTo < nowSec - 7 * 86400) continue;
           const coords = parseCompactMarineCoords(blk);
           const geometry =
             coordsToGeoJsonGeometry(coords) ??
@@ -1115,19 +1167,21 @@ async function fetchGlobalWmoMarineBulletins(
 
           localFeatures.push(
             buildFeature({
-              id: `${src.idPrefix}-${nrMatch[1].replace("/", "-")}`,
-              subType: "NAVAREA",
+              id: `WMO-NAVAREA-V-BR-${nrMatch[1].replace("/", "-")}-ISSUE-${issuedAt}`,
+              subType: "MARINE WEATHER",
               severity: DANGER_REGEX.test(blk) ? "danger" : "warning",
-              title: `NAVAREA ${src.navArea} — ${subTitle} (${nrMatch[1]})`,
+              title: `METAREA ${src.navArea} — ${subTitle} (${nrMatch[1]})`,
               rawText: blk.trim(),
-              stationOrArea: `NAVAREA ${src.navArea}`,
+              stationOrArea: `METAREA ${src.navArea}`,
               issuer: src.issuer,
               country: src.country,
               region: src.region,
               geometry,
-              issuedAt: nowSec,
-              validFrom: nowSec - 3600,
-              validTo: nowSec + 36 * 3600,
+              issuedAt,
+              validFrom,
+              validTo,
+              sourceUrl: src.url,
+              ...(!coords.length ? { geometryNote: "Approximate location. The bulletin did not supply mappable coordinates." } : {}),
             })
           );
         }
@@ -1135,6 +1189,7 @@ async function fetchGlobalWmoMarineBulletins(
       }
 
       // Case C: JMA / MetService NZ / BoM / DIRECTEMAR / SMN marine warning segments
+      if (!recentBulletin || (validTo !== null && validTo <= issuedAt)) return [];
       const segments = rawBulletin.split(
         /\n(?=(?:HURRICANE|TYPHOON|CYCLONE|STORM|GALE)\s+WARNING|WARNING\.)/i
       );
@@ -1146,12 +1201,13 @@ async function fetchGlobalWmoMarineBulletins(
         ) {
           continue;
         }
-        const cleanSeg = seg.split(/\nSUMMARY\./i)[0]?.trim() ?? "";
-        if (!cleanSeg) continue;
+        const cleanSeg = seg.split(/\nSUMMARY\./i)[0].trim();
+        if (!cleanSeg || !/^(?:HURRICANE|TYPHOON|CYCLONE|STORM|GALE)\s+WARNING\b|^WARNING\./i.test(cleanSeg)) continue;
 
-        const ddmCoords = parseNgaCoordinates(cleanSeg);
+        const currentText = cleanSeg.split(/\nFORECAST POSITION\b/i)[0];
+        const ddmCoords = parseNgaCoordinates(currentText);
         const coords =
-          ddmCoords.length > 0 ? ddmCoords : parseCompactMarineCoords(cleanSeg);
+          ddmCoords.length > 0 ? ddmCoords : parseCompactMarineCoords(currentText);
 
         let geometry: Geometry | null = null;
         const radMatch = /within\s+(\d{1,4})\s*(?:nautical\s+)?miles/i.exec(cleanSeg);
@@ -1186,19 +1242,21 @@ async function fetchGlobalWmoMarineBulletins(
 
         localFeatures.push(
           buildFeature({
-            id: `${src.idPrefix}-${segNum}`,
-            subType: "NAVAREA",
+            id: `${src.idPrefix}-ISSUE-${issuedAt}-${segNum}`,
+            subType: "MARINE WEATHER",
             severity: DANGER_REGEX.test(cleanSeg) ? "danger" : "warning",
-            title: `NAVAREA ${src.navArea} — ${firstLine}`,
+            title: `METAREA ${src.navArea} — ${firstLine}`,
             rawText: cleanSeg.slice(0, 4000),
-            stationOrArea: `NAVAREA ${src.navArea}`,
+            stationOrArea: `METAREA ${src.navArea}`,
             issuer: src.issuer,
             country: src.country,
             region: src.region,
             geometry,
-            issuedAt: nowSec,
-            validFrom: nowSec - 3600,
-            validTo: nowSec + 24 * 3600,
+            issuedAt,
+            validFrom: issuedAt,
+            validTo: validTo ?? issuedAt + 24 * 3600,
+            sourceUrl: src.url,
+            geometryNote: "Approximate footprint interpreted from the marine weather bulletin.",
           })
         );
       }
@@ -1207,9 +1265,11 @@ async function fetchGlobalWmoMarineBulletins(
     })
   );
 
-  for (const res of settled) {
+  for (const [index, res] of settled.entries()) {
     if (res.status === "fulfilled") {
       features.push(...res.value);
+    } else {
+      console.warn(`[ngaMaritime] ${WMO_GLOBAL_MARINE_SOURCES[index].idPrefix} failed:`, res.reason);
     }
   }
 
@@ -1220,7 +1280,8 @@ async function fetchGlobalWmoMarineBulletins(
 // Unified Global Maritime Aggregator
 // ---------------------------------------------------------------------------
 export async function fetchNgaMaritimeHazards(
-  nowSec: number
+  nowSec: number,
+  onSnapshot?: SnapshotHandler
 ): Promise<HazardFeature[]> {
   const boundaries = await loadNavAreaBoundaries();
 
@@ -1234,7 +1295,7 @@ export async function fetchNgaMaritimeHazards(
   ];
 
   const settled = await Promise.allSettled([
-    fetchNgaMsiBroadcasts(nowSec, boundaries),
+    fetchNgaMsiBroadcasts(nowSec, boundaries, onSnapshot),
     fetchUkhoAdmiraltyWarnings(nowSec),
     fetchDmaNiordWarnings(nowSec),
     fetchHnhsGreeceWarnings(nowSec),

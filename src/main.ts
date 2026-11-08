@@ -31,10 +31,10 @@ function toMapCriteria(
   };
 }
 
-function countVisibleFeatures(
+function matchingTimeBounds(
   features: HazardFeature[],
   criteria: MapFilterCriteria
-): number {
+): { starts: number[]; ends: number[] } {
   const q = criteria.searchQuery.trim().toUpperCase();
   const domainSet = new Set(criteria.domains);
   const subTypeSet = new Set(criteria.subTypes);
@@ -44,14 +44,15 @@ function countVisibleFeatures(
       ? criteria.referenceNowSec - criteria.recencyHours * 3600
       : 0;
 
-  let count = 0;
+  const starts: number[] = [];
+  const ends: number[] = [];
 
   for (const feat of features) {
     const p = feat.properties;
     if (!domainSet.has(p.domain)) continue;
     if (!subTypeSet.has(p.subType)) continue;
     if (!sevSet.has(p.severity)) continue;
-    if (p.validFrom > criteria.timestampSec || p.validTo < criteria.timestampSec) {
+    if (!Number.isFinite(p.validFrom) || !Number.isFinite(p.validTo) || p.validFrom > p.validTo) {
       continue;
     }
 
@@ -80,19 +81,35 @@ function countVisibleFeatures(
     if (criteria.durationPreset === "medium" && (dur < 6 || dur > 48)) continue;
     if (criteria.durationPreset === "long" && dur <= 48) continue;
 
-    if (q.length > 0) {
-      const inTitle = (p.title ?? "").toUpperCase().includes(q);
-      const inStation = (p.stationOrArea ?? "").toUpperCase().includes(q);
-      const inIssuer = (p.issuer ?? "").toUpperCase().includes(q);
-      const inCountry = (p.country ?? "").toUpperCase().includes(q);
-      const inRaw = (p.rawText ?? "").toUpperCase().includes(q);
-      if (!inTitle && !inStation && !inIssuer && !inCountry && !inRaw) continue;
-    }
+    if (
+      q.length > 0 &&
+      !(p.title ?? "").toUpperCase().includes(q) &&
+      !(p.stationOrArea ?? "").toUpperCase().includes(q) &&
+      !(p.issuer ?? "").toUpperCase().includes(q) &&
+      !(p.country ?? "").toUpperCase().includes(q) &&
+      !(p.rawText ?? "").toUpperCase().includes(q)
+    ) continue;
 
-    count++;
+    starts.push(p.validFrom);
+    ends.push(p.validTo);
   }
 
-  return count;
+  return {
+    starts: starts.sort((a, b) => a - b),
+    ends: ends.sort((a, b) => a - b),
+  };
+}
+
+// Count started records minus expired records using sorted inclusive time bounds.
+function countBefore(values: number[], cutoff: number): number {
+  let start = 0;
+  let end = values.length;
+  while (start < end) {
+    const mid = Math.floor((start + end) / 2);
+    if (values[mid] < cutoff) start = mid + 1;
+    else end = mid;
+  }
+  return start;
 }
 
 function bootstrap(): void {
@@ -108,18 +125,19 @@ function bootstrap(): void {
   }
 
   let loadedCollection: HazardFeatureCollection | null = null;
+  let feedError: string | undefined;
+  let indexedCriteria = "";
+  let indexedBounds = { starts: [] as number[], ends: [] as number[] };
 
   const drawer = initDetailDrawer(drawerMount);
 
-  let syncAllFilters = () => {};
-
-  const pills = initFilterPills(pillsMount, () => {
-    syncAllFilters();
-  });
-
-  const scrubber = initTimeScrubber(scrubberMount, () => {
-    syncAllFilters();
-  });
+  let syncFrame = 0;
+  function scheduleSync(): void {
+    if (syncFrame) return;
+    syncFrame = window.requestAnimationFrame(syncAllFilters);
+  }
+  const pills = initFilterPills(pillsMount, scheduleSync);
+  const scrubber = initTimeScrubber(scrubberMount, scheduleSync);
 
   const initialCriteria = toMapCriteria(
     scrubber.getTimestampSec(),
@@ -128,41 +146,59 @@ function bootstrap(): void {
   );
 
   const mapController = initMapCanvas(mapEl, initialCriteria, {
-    onSelectFeature(selection) {
-      drawer.open(selection);
+    onSelectFeature(selections) {
+      drawer.open(selections);
     },
     onDataLoaded(collection) {
-      loadedCollection = collection;
-      pills.populateIssuers(collection.features);
-      syncAllFilters();
+      feedError = undefined;
+      if (loadedCollection !== collection) {
+        loadedCollection = collection;
+        indexedCriteria = "";
+        pills.populateIssuers(collection.features);
+      }
+      scheduleSync();
     },
     onDataError(message) {
-      pills.updateStats({
-        visibleCount: 0,
-        totalCount: 0,
-        errorMessage: message,
-      });
+      feedError = message;
+      scheduleSync();
+    },
+    onBasemapUnavailable() {
+      pills.showBasemapUnavailable();
     },
   });
 
-  syncAllFilters = () => {
+  function syncAllFilters(): void {
+    syncFrame = 0;
     const nowSec = Math.floor(Date.now() / 1000);
     const ts = scrubber.getTimestampSec();
-    const criteria = toMapCriteria(ts, nowSec, pills.getState());
+    const state = pills.getState();
+    const referenceNow = Math.floor(nowSec / 60) * 60;
+    const criteria = toMapCriteria(ts, referenceNow, state);
     mapController.updateFilters(criteria);
 
     if (loadedCollection) {
-      const visibleCount = countVisibleFeatures(
-        loadedCollection.features,
-        criteria
-      );
+      const { timestampSec, referenceNowSec, ...matchingCriteria } = criteria;
+      const cacheKey = JSON.stringify([
+        matchingCriteria,
+        state.recencyHours > 0 ? referenceNowSec : 0,
+      ]);
+      if (cacheKey !== indexedCriteria) {
+        indexedBounds = matchingTimeBounds(loadedCollection.features, criteria);
+        indexedCriteria = cacheKey;
+      }
+      const visibleCount =
+        countBefore(indexedBounds.starts, timestampSec + 1) -
+        countBefore(indexedBounds.ends, timestampSec);
       pills.updateStats({
         visibleCount,
         totalCount: loadedCollection.features.length,
         generatedAtSec: loadedCollection.metadata?.generatedAt,
+        errorMessage: feedError ? "Refresh failed. Showing last loaded feed." : undefined,
       });
+    } else if (feedError) {
+      pills.updateStats({ visibleCount: 0, totalCount: 0, errorMessage: feedError });
     }
-  };
+  }
 }
 
 bootstrap();

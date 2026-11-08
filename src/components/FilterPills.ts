@@ -1,9 +1,10 @@
-import type {
-  HazardDomain,
-  HazardFeature,
-  HazardRegion,
-  HazardSeverity,
-  HazardSubType,
+import {
+  HAZARD_SUB_TYPES,
+  type HazardDomain,
+  type HazardFeature,
+  type HazardRegion,
+  type HazardSeverity,
+  type HazardSubType,
 } from "../types/schema";
 
 export type SizeFilterPreset =
@@ -35,21 +36,15 @@ export interface FilterPillsController {
     generatedAtSec?: number;
     errorMessage?: string;
   }) => void;
+  showBasemapUnavailable: () => void;
   populateIssuers: (features: HazardFeature[]) => void;
   getState: () => FilterPillsState;
 }
 
 const ALL_DOMAINS: HazardDomain[] = ["notam", "maritime", "weather"];
-const ALL_SUBTYPES: HazardSubType[] = [
-  "NOTAM",
-  "TFR",
-  "NAVAREA",
-  "NAVTEX",
-  "SIGMET",
-  "METAR",
-  "TAF",
-];
+const ALL_SUBTYPES = HAZARD_SUB_TYPES;
 const ALL_SEVERITIES: HazardSeverity[] = ["danger", "warning", "info"];
+const FEED_STALE_SEC = 45 * 60;
 
 const DOMAIN_OPTIONS: Array<{
   id: HazardDomain;
@@ -109,10 +104,8 @@ const DURATION_OPTIONS: Array<{ value: DurationFilterPreset; label: string }> = 
 ];
 
 function formatShortUtc(sec: number): string {
-  const d = new Date(sec * 1000);
-  const hh = String(d.getUTCHours()).padStart(2, "0");
-  const mm = String(d.getUTCMinutes()).padStart(2, "0");
-  return `${hh}:${mm} UTC`;
+  const timestamp = new Date(sec * 1000).toISOString();
+  return `${timestamp.slice(11, 16)} UTC`;
 }
 
 function countNonDefaultAdvancedFilters(state: FilterPillsState): number {
@@ -205,6 +198,14 @@ export function initFilterPills(
   const statsEl = document.createElement("div");
   statsEl.className = "feed-stats";
   statsEl.textContent = "Loading global feed…";
+  const feedNotice = document.createElement("div");
+  feedNotice.className = "feed-notice";
+  feedNotice.setAttribute("role", "status");
+  feedNotice.hidden = true;
+  const mapNotice = document.createElement("div");
+  mapNotice.className = "feed-notice";
+  mapNotice.setAttribute("role", "status");
+  mapNotice.hidden = true;
 
   header.append(brandGroup, statsEl);
 
@@ -491,23 +492,31 @@ export function initFilterPills(
     }
 
     notifyChange();
+    searchInput.focus({ preventScroll: true });
   });
 
-  panel.append(header, searchLandmark, domainGroup, severityRow, detailsEl);
+  panel.append(header, feedNotice, mapNotice, searchLandmark, domainGroup, severityRow, detailsEl);
   mount.replaceChildren(panel);
 
   return {
     updateStats({ visibleCount, totalCount, generatedAtSec, errorMessage }) {
-      if (errorMessage) {
-        statsEl.textContent = errorMessage;
-        statsEl.dataset.error = "true";
-        return;
-      }
-      delete statsEl.dataset.error;
+      statsEl.hidden = generatedAtSec === undefined && Boolean(errorMessage);
       const updatedSuffix = generatedAtSec
         ? ` • ${formatShortUtc(generatedAtSec)}`
         : "";
-      statsEl.textContent = `${visibleCount.toLocaleString()} shown / ${totalCount.toLocaleString()} total${updatedSuffix}`;
+      const stats = `${visibleCount.toLocaleString()} matching / ${totalCount.toLocaleString()} total${updatedSuffix}`;
+      if (statsEl.textContent !== stats) statsEl.textContent = stats;
+      const stale = generatedAtSec !== undefined &&
+        Date.now() / 1000 - generatedAtSec > FEED_STALE_SEC;
+      const notice = errorMessage ?? (stale
+        ? `Feed is out of date. Last updated ${new Date(generatedAtSec * 1000).toISOString().slice(0, 10)} at ${formatShortUtc(generatedAtSec)}.`
+        : "");
+      feedNotice.hidden = !notice;
+      if (feedNotice.textContent !== notice) feedNotice.textContent = notice;
+    },
+    showBasemapUnavailable() {
+      mapNotice.hidden = false;
+      mapNotice.textContent = "Basemap unavailable. Alert geometry can still be displayed.";
     },
     populateIssuers(features) {
       const counts = new Map<string, number>();

@@ -378,6 +378,8 @@ async function fetchUnauthenticatedFaaTfrs(
             issuedAt,
             validFrom,
             validTo,
+            sourceUrl: "https://tfr.faa.gov/",
+            ...(!wfsGeoms.length ? { geometryNote: "Approximate geometry extracted from the FAA notice text." } : {}),
             ...(info?.altitudeMinFt !== undefined
               ? { altitudeMinFt: info.altitudeMinFt }
               : {}),
@@ -407,27 +409,34 @@ async function fetchAuthenticatedFaaNotams(
     return [];
   }
 
-  const url =
-    "https://external-api.faa.gov/notamapi/v1/notams?responseFormat=geoJson&pageSize=1000";
+  const url = new URL("https://external-api.faa.gov/notamapi/v1/notams");
+  const pageSize = 1000;
+  const maxPages = 10;
+  const deadline = AbortSignal.timeout(90000);
+  url.searchParams.set("responseFormat", "geoJson");
+  url.searchParams.set("pageSize", String(pageSize));
   const features: HazardFeature[] = [];
+  const seen = new Set<string>();
+  let received = 0;
 
   try {
-    const res = await fetch(url, {
-      headers: {
-        ...FETCH_HEADERS,
-        client_id: clientId,
-        client_secret: clientSecret,
-      },
-      signal: AbortSignal.timeout(25000),
-    });
+    for (let page = 1; page <= maxPages; page++) {
+      url.searchParams.set("pageNumber", String(page));
+      const res = await fetch(url, {
+        headers: {
+          ...FETCH_HEADERS,
+          client_id: clientId,
+          client_secret: clientSecret,
+        },
+        signal: AbortSignal.any([AbortSignal.timeout(25000), deadline]),
+      });
 
-    if (!res.ok) {
-      console.warn(`[faaNotam] Authenticated FAA NOTAM API HTTP ${res.status}`);
-      return features;
-    }
+      if (!res.ok) {
+        console.warn(`[faaNotam] Authenticated FAA NOTAM API page ${page} HTTP ${res.status}`);
+        break;
+      }
 
-    const data = (await res.json()) as {
-      items?: Array<{
+      type Item = {
         geometry?: Geometry;
         properties?: {
           coreNOTAMData?: {
@@ -435,84 +444,114 @@ async function fetchAuthenticatedFaaNotams(
             notamTranslation?: Array<{ formattedText?: string }>;
           };
         };
-      }>;
-    };
-
-    for (const item of data.items ?? []) {
-      const notam = item.properties?.coreNOTAMData?.notam;
-      if (!notam) continue;
-
-      const idNum = String(notam.id ?? notam.number ?? "");
-      const icaoLocation = String(
-        notam.icaoLocation ?? notam.location ?? "FAA"
-      ).toUpperCase();
-      const rawText = String(
-        item.properties?.coreNOTAMData?.notamTranslation?.[0]?.formattedText ??
-          notam.text ??
-          ""
-      ).trim();
-      if (!rawText) continue;
-
-      let geometry: Geometry | null = item.geometry ?? null;
-      if (!geometry) {
-        const qCoord = String(notam.coordinates ?? "");
-        const radiusStr = String(notam.radius ?? "005").padStart(3, "0");
-        if (qCoord) {
-          geometry = parseNotamQLineCircle(`${qCoord}${radiusStr}`);
-        }
+      };
+      const data = (await res.json()) as {
+        totalCount?: number;
+        totalNotamCount?: number;
+        items?: Item[];
+        features?: Item[];
+        data?: { features?: Item[] };
+      };
+      const items = data.items ?? data.features ?? data.data?.features;
+      if (!Array.isArray(items)) {
+        console.warn(`[faaNotam] Authenticated FAA NOTAM API page ${page} did not contain items`);
+        break;
       }
-      if (!geometry) {
-        const qMatch = /\b(\d{4}[NS]\d{5}[EW]\d{3})\b/.exec(rawText);
-        if (qMatch) {
-          geometry = parseNotamQLineCircle(qMatch[1]);
+
+      received += items.length;
+      const previousCount = seen.size;
+      for (const item of items) {
+        const notam = item.properties?.coreNOTAMData?.notam;
+        if (!notam) continue;
+
+        const idNum = String(notam.id ?? notam.number ?? "");
+        const icaoLocation = String(
+          notam.icaoLocation ?? notam.location ?? "FAA"
+        ).toUpperCase();
+        if (idNum) {
+          const key = `${icaoLocation}-${idNum}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
         }
+        const rawText = String(
+          item.properties?.coreNOTAMData?.notamTranslation?.[0]?.formattedText ??
+            notam.text ??
+            ""
+        ).trim();
+        if (!rawText) continue;
+
+        let geometry: Geometry | null = item.geometry ?? null;
+        if (!geometry) {
+          const qCoord = String(notam.coordinates ?? "");
+          const radiusStr = String(notam.radius ?? "005").padStart(3, "0");
+          if (qCoord) {
+            geometry = parseNotamQLineCircle(`${qCoord}${radiusStr}`);
+          }
+        }
+        if (!geometry) {
+          const qMatch = /\b(\d{4}[NS]\d{5}[EW]\d{3})\b/.exec(rawText);
+          if (qMatch) {
+            geometry = parseNotamQLineCircle(qMatch[1]);
+          }
+        }
+        if (!geometry) continue;
+
+        const issuedMs = Date.parse(String(notam.issued ?? ""));
+        const startMs = Date.parse(String(notam.effectiveStart ?? ""));
+        const endMs = Date.parse(String(notam.effectiveEnd ?? ""));
+
+        const issuedAt = !Number.isNaN(issuedMs)
+          ? Math.floor(issuedMs / 1000)
+          : nowSec;
+        const validFrom = !Number.isNaN(startMs)
+          ? Math.floor(startMs / 1000)
+          : issuedAt;
+        const validTo = !Number.isNaN(endMs)
+          ? Math.floor(endMs / 1000)
+          : Math.max(nowSec, validFrom) + 7 * 86400;
+        if (validTo <= validFrom) continue;
+
+        const severity: HazardSeverity =
+          /CLOSED|CLSD|PROHIBITED|RESTRICTED|TFR|UNSERVICEABLE|HAZARD/i.test(
+            rawText
+          )
+            ? "danger"
+            : "warning";
+
+        const meta = resolveIcaoMetadata(icaoLocation, "notam");
+
+        features.push({
+          type: "Feature",
+          geometry,
+          properties: {
+            id: `FAA-NOTAM-${icaoLocation}-${idNum || validFrom}`,
+            domain: "notam",
+            subType: "NOTAM",
+            severity,
+            title: `${icaoLocation} NOTAM ${notam.number ?? idNum}`,
+            rawText,
+            stationOrArea: icaoLocation,
+            issuer: meta.issuer,
+            country: meta.country,
+            region: meta.region,
+            areaSqKm: computeGeometryAreaSqKm(geometry),
+            durationHours: computeDurationHours(validFrom, validTo),
+            issuedAt,
+            validFrom,
+            validTo,
+            sourceUrl: "https://notams.aim.faa.gov/notamSearch/",
+            ...(!item.geometry ? { geometryNote: "Approximate location from the ICAO Q-line." } : {}),
+          },
+        });
       }
-      if (!geometry) continue;
-
-      const issuedMs = Date.parse(String(notam.issued ?? ""));
-      const startMs = Date.parse(String(notam.effectiveStart ?? ""));
-      const endMs = Date.parse(String(notam.effectiveEnd ?? ""));
-
-      const issuedAt = !Number.isNaN(issuedMs)
-        ? Math.floor(issuedMs / 1000)
-        : nowSec;
-      const validFrom = !Number.isNaN(startMs)
-        ? Math.floor(startMs / 1000)
-        : issuedAt;
-      const validTo = !Number.isNaN(endMs)
-        ? Math.floor(endMs / 1000)
-        : nowSec + 7 * 86400;
-
-      const severity: HazardSeverity =
-        /CLOSED|CLSD|PROHIBITED|RESTRICTED|TFR|UNSERVICEABLE|HAZARD/i.test(
-          rawText
-        )
-          ? "danger"
-          : "warning";
-
-      const meta = resolveIcaoMetadata(icaoLocation, "notam");
-
-      features.push({
-        type: "Feature",
-        geometry,
-        properties: {
-          id: `FAA-NOTAM-${icaoLocation}-${idNum || validFrom}`,
-          domain: "notam",
-          subType: "NOTAM",
-          severity,
-          title: `${icaoLocation} NOTAM ${notam.number ?? idNum}`,
-          rawText,
-          stationOrArea: icaoLocation,
-          issuer: meta.issuer,
-          country: meta.country,
-          region: meta.region,
-          areaSqKm: computeGeometryAreaSqKm(geometry),
-          durationHours: computeDurationHours(validFrom, validTo),
-          issuedAt,
-          validFrom,
-          validTo,
-        },
-      });
+      if (items.length === 0) break;
+      if (seen.size === previousCount && page > 1) {
+        console.warn(`[faaNotam] Authenticated FAA NOTAM API page ${page} repeated previously received notices`);
+        break;
+      }
+      const total = data.totalCount ?? data.totalNotamCount;
+      if (total === undefined ? items.length < pageSize : received >= total) break;
+      if (page === maxPages) console.warn("[faaNotam] Authenticated FAA NOTAM API page limit reached");
     }
   } catch (err) {
     console.warn(

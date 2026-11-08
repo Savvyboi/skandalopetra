@@ -9,7 +9,12 @@ import { fetchAwcWeatherHazards } from "./parsers/awcWeather.ts";
 import { fetchFaaNotamHazards } from "./parsers/faaNotam.ts";
 import { fetchGlobalIcaoNotams } from "./parsers/globalNotam.ts";
 import { fetchNgaMaritimeHazards } from "./parsers/ngaMaritime.ts";
+import { fetchKystverketHazards } from "./parsers/kystverket.ts";
+import { fetchNwsAlerts } from "./parsers/nwsAlerts.ts";
+import { fetchDeceaNotamHazards } from "./parsers/deceaNotam.ts";
+import { fetchCcgNavwarnHazards } from "./parsers/ccgNavwarn.ts";
 import {
+  closePolygonRings,
   computeDurationHours,
   computeGeometryAreaSqKm,
 } from "./utils/geometry.ts";
@@ -22,6 +27,12 @@ const USER_AGENT = "GlobalHazardTracker/1.0 (+https://github.com)";
 
 function backfillArchiveFeature(feat: HazardFeature): HazardFeature {
   const p = feat.properties;
+  if (p.subType === "TAF") delete p.altitudeMaxFt;
+  const geometry = closePolygonRings(feat.geometry);
+  if (geometry !== feat.geometry) {
+    feat.geometry = geometry;
+    p.areaSqKm = computeGeometryAreaSqKm(geometry);
+  }
   if (
     p.issuer &&
     p.country &&
@@ -62,26 +73,64 @@ function backfillArchiveFeature(feat: HazardFeature): HazardFeature {
   };
 }
 
-function isLegacyWholeOceanFallback(feat: HazardFeature): boolean {
+function isLegacyArtifact(feat: HazardFeature): boolean {
   const p = feat.properties;
-  if (p.id.endsWith("-BULLETIN")) return true;
-  if (p.id.startsWith("WMO-NAVAREA-")) {
-    const area =
-      typeof p.areaSqKm === "number"
-        ? p.areaSqKm
-        : computeGeometryAreaSqKm(feat.geometry);
-    if (area > 8_000_000) return true;
+  return p.id.endsWith("-BULLETIN") ||
+    (p.id.startsWith("WMO-NAVAREA-") && !p.id.includes("-ISSUE-"));
+}
+
+function readArchive(data: unknown): Map<string, HazardFeature> {
+  const collection = data as Partial<HazardFeatureCollection> | null;
+  if (collection?.type !== "FeatureCollection" || !Array.isArray(collection.features)) {
+    throw new Error("Invalid archive FeatureCollection");
   }
-  return false;
+  const archive = new Map<string, HazardFeature>();
+  for (const feature of collection.features) {
+    if (isUsableFeature(feature) && !isLegacyArtifact(feature)) {
+      archive.set(feature.properties.id, backfillArchiveFeature(feature));
+    }
+  }
+  if (collection.features.length > 0 && archive.size === 0) {
+    throw new Error("Archive contains no usable hazard features");
+  }
+  return archive;
+}
+
+function isUsableFeature(feature: HazardFeature | null | undefined): feature is HazardFeature {
+  const p = feature?.properties;
+  return Boolean(
+    feature?.geometry && p?.id &&
+    Number.isFinite(p.validFrom) && Number.isFinite(p.validTo) && p.validFrom <= p.validTo
+  );
+}
+
+async function writeFeed(filePath: string, data: string): Promise<void> {
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  try {
+    await fs.writeFile(tempPath, data, "utf8");
+    await fs.rename(tempPath, filePath);
+  } finally {
+    await fs.rm(tempPath, { force: true });
+  }
 }
 
 async function loadExistingArchive(
   repoOwnerAndName: string,
   localFallbackPath: string
 ): Promise<Map<string, HazardFeature>> {
-  const archive = new Map<string, HazardFeature>();
-  const archiveUrl = `https://raw.githubusercontent.com/${repoOwnerAndName}/data-feed/alerts.geojson`;
+  if (process.env.ARCHIVE_FROM_CHECKOUT === "true") {
+    try {
+      const archive = readArchive(JSON.parse(await fs.readFile(localFallbackPath, "utf8")));
+      console.log(`[ingest] Loaded ${archive.size} features from the current data-feed commit`);
+      return archive;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+      throw err;
+    }
+  }
 
+  const archiveUrl = `https://raw.githubusercontent.com/${repoOwnerAndName}/data-feed/alerts.geojson`;
   try {
     const res = await fetch(archiveUrl, {
       headers: { "User-Agent": USER_AGENT },
@@ -89,18 +138,9 @@ async function loadExistingArchive(
     });
 
     if (res.ok) {
-      const data = (await res.json()) as Partial<HazardFeatureCollection>;
-      if (Array.isArray(data.features)) {
-        for (const feat of data.features) {
-          if (feat?.properties?.id && feat.geometry) {
-            if (isLegacyWholeOceanFallback(feat)) continue;
-            archive.set(feat.properties.id, backfillArchiveFeature(feat));
-          }
-        }
-        console.log(
-          `[ingest] Loaded ${archive.size} cached features from ${archiveUrl}`
-        );
-      }
+      const archive = readArchive(await res.json());
+      console.log(`[ingest] Loaded ${archive.size} cached features from ${archiveUrl}`);
+      return archive;
     } else if (res.status === 404) {
       console.log(
         `[ingest] Remote data-feed archive not found yet (404); checking local cache...`
@@ -118,28 +158,13 @@ async function loadExistingArchive(
   }
 
   try {
-    const rawLocal = await fs.readFile(localFallbackPath, "utf8");
-    const parsed = JSON.parse(rawLocal) as Partial<HazardFeatureCollection>;
-    if (Array.isArray(parsed.features)) {
-      let addedLocal = 0;
-      for (const feat of parsed.features) {
-        if (feat?.properties?.id && feat.geometry) {
-          if (isLegacyWholeOceanFallback(feat)) continue;
-          archive.set(feat.properties.id, backfillArchiveFeature(feat));
-          addedLocal++;
-        }
-      }
-      if (addedLocal > 0) {
-        console.log(
-          `[ingest] Merged ${addedLocal} local cached features -> ${archive.size} total archive entries`
-        );
-      }
-    }
-  } catch {
-    // No local cache yet — proceed with remote archive
+    const archive = readArchive(JSON.parse(await fs.readFile(localFallbackPath, "utf8")));
+    console.log(`[ingest] Loaded ${archive.size} cached features from the local archive`);
+    return archive;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+    throw err;
   }
-
-  return archive;
 }
 
 async function main(): Promise<void> {
@@ -162,40 +187,70 @@ async function main(): Promise<void> {
 
   const featureMap = await loadExistingArchive(repoOwnerAndName, outPath);
 
-  const parserJobs = await Promise.allSettled([
-    fetchAwcWeatherHazards(now),
-    fetchNgaMaritimeHazards(now),
-    fetchFaaNotamHazards(now),
-    fetchGlobalIcaoNotams(now),
-  ]);
+  const snapshots = new Map<string, ReadonlySet<string>>();
+  const expiries = new Map<string, number>();
+  const stationReports = new Map<string, { issuedAt: number; effectiveAt: number }>();
+  const recordSnapshot = (idPrefix: string, activeIds: ReadonlySet<string>) => {
+    snapshots.set(idPrefix, activeIds);
+  };
+  const recordExpiry = (id: string, expiresAt: number) => {
+    if (Number.isFinite(expiresAt)) expiries.set(id, Math.min(expiries.get(id) ?? now - 1, expiresAt));
+  };
 
-  const parserNames = [
-    "awcWeather",
-    "ngaMaritime",
-    "faaNotam",
-    "globalNotam",
-  ];
-  parserJobs.forEach((result, idx) => {
-    const name = parserNames[idx];
+  const jobs = {
+    awcWeather: fetchAwcWeatherHazards((product, station, issuedAt, effectiveAt) => {
+      const key = `${product}-${station}`;
+      if (issuedAt > (stationReports.get(key)?.issuedAt ?? 0)) {
+        stationReports.set(key, { issuedAt, effectiveAt });
+      }
+    }),
+    ngaMaritime: fetchNgaMaritimeHazards(now, recordSnapshot),
+    faaNotam: fetchFaaNotamHazards(now),
+    globalNotam: fetchGlobalIcaoNotams(now, recordExpiry),
+    deceaNotam: fetchDeceaNotamHazards(now),
+    kystverket: fetchKystverketHazards(now, recordSnapshot),
+    ccgNavwarn: fetchCcgNavwarnHazards(now, recordSnapshot),
+    nwsAlerts: fetchNwsAlerts(recordSnapshot),
+  };
+  const names = Object.keys(jobs);
+  const results = await Promise.allSettled(Object.values(jobs));
+  let received = 0;
+  results.forEach((result, idx) => {
     if (result.status === "fulfilled") {
       for (const feature of result.value) {
-        if (feature?.properties?.id && feature.geometry) {
+        if (isUsableFeature(feature)) {
           featureMap.set(feature.properties.id, feature);
+          received++;
         }
       }
     } else {
       console.warn(
-        `[ingest] Parser ${name} rejected (retaining cached records):`,
+        `[ingest] Parser ${names[idx]} rejected (retaining cached records):`,
         result.reason
       );
     }
   });
+  if (received === 0) {
+    throw new Error("No usable features returned by any source. Keeping the previous feed.");
+  }
 
   const activeFeatures: HazardFeature[] = [];
   for (const feature of featureMap.values()) {
-    if (feature.properties.validTo >= sevenDaysAgo) {
-      activeFeatures.push(feature);
+    const p = feature.properties;
+    let validTo = Math.min(p.validTo, expiries.get(p.id) ?? p.validTo);
+    if (p.subType === "METAR" || p.subType === "TAF") {
+      const report = stationReports.get(`${p.subType}-${p.stationOrArea}`);
+      if (report && p.issuedAt < report.issuedAt) validTo = Math.min(validTo, report.effectiveAt - 1);
     }
+    for (const [prefix, activeIds] of snapshots) {
+      if (p.id.startsWith(prefix) && !activeIds.has(p.id)) validTo = Math.min(validTo, now - 1);
+    }
+    if (validTo < sevenDaysAgo || validTo < p.validFrom) continue;
+    if (validTo !== p.validTo) {
+      p.validTo = validTo;
+      p.durationHours = computeDurationHours(p.validFrom, validTo);
+    }
+    activeFeatures.push(feature);
   }
 
   const countsByDomain = { notam: 0, maritime: 0, weather: 0 };
@@ -216,18 +271,17 @@ async function main(): Promise<void> {
     features: activeFeatures,
   };
 
-  await fs.mkdir(distDataDir, { recursive: true });
   const serialized = JSON.stringify(collection);
-  await fs.writeFile(outPath, serialized, "utf8");
+  const sizeMiB = Buffer.byteLength(serialized, "utf8") / (1024 * 1024);
+  if (sizeMiB > 100) throw new Error("Feed exceeds GitHub's 100 MiB file limit. Keeping the previous feed.");
+  if (sizeMiB > 50) console.warn(`[ingest] Feed is ${sizeMiB.toFixed(2)} MiB. GitHub's file limit is 100 MiB.`);
+  await writeFeed(outPath, serialized);
+  if (process.env.ARCHIVE_FROM_CHECKOUT !== "true") {
+    await writeFeed(publicFallbackPath, serialized);
+  }
 
-  await fs.mkdir(path.dirname(publicFallbackPath), { recursive: true });
-  await fs.copyFile(outPath, publicFallbackPath);
-
-  const sizeMb = (Buffer.byteLength(serialized, "utf8") / (1024 * 1024)).toFixed(
-    2
-  );
   console.log(
-    `[ingest] Wrote ${activeFeatures.length} features (${sizeMb} MB) -> notam=${countsByDomain.notam}, maritime=${countsByDomain.maritime}, weather=${countsByDomain.weather}`
+    `[ingest] Wrote ${activeFeatures.length} features (${sizeMiB.toFixed(2)} MiB) -> notam=${countsByDomain.notam}, maritime=${countsByDomain.maritime}, weather=${countsByDomain.weather}`
   );
   console.log(`[ingest] Regional breakdown:`, countsByRegion);
 }

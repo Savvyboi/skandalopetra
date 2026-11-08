@@ -1,12 +1,22 @@
 # AGENTS.md — Global Aviation, Maritime & Weather Hazard Tracker
 
+## Current implementation and follow-up
+
+The sections below describe the original design. The implementation keeps the static GitHub Pages architecture, scheduled ingestion, rolling seven-day archive, and MapLibre timeline. The checked-out `data-feed` commit is the archive input for publishing runs. Complete active snapshots retire withdrawn records while preserving history, and a run with zero usable upstream records stops before publishing.
+
+Source expansion includes DECEA AISWEB for credentialed Brazilian domestic NOTAMs, Kystverket coastal and NAVAREA XIX warnings, Canadian Coast Guard coastal and Arctic notices, AWC Center Weather Advisories and Alaska AIRMETs, and selected NWS CAP alerts with published polygons. The [coverage and setup table](README.md#additional-official-coverage) describes each feed’s scope. The map uses an advancing UTC Live clock, a periodic feed check, and indexed timeline counts. Frame rates depend on the device and the amount of geometry loaded.
+
+Remaining source work is to verify DECEA with provisioned credentials, onboard the successor FAA NOTAM Management Service, and resolve NWS zone-only alerts against authoritative zone boundaries. Model CONUS G-AIRMETs as forecast snapshots before including them on the continuous timeline.
+
+Measure initial map load and scrubbing with a full seven days of data on mobile hardware. If payload growth warrants it, split the static feed into a small live index and time-partitioned archives. The ingestion job logs a size warning before the [GitHub single-file limit](https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github) is reached.
+
 ## 1. Project Overview & Core Constraints
 You are building a 100% free, open-source, static web application hosted on **GitHub Pages** that visualizes global **Aviation NOTAMs/TFRs**, **Maritime Navigational Warnings (NAVAREAs)**, and **Aviation/Marine Weather Warnings (METARs, TAFs, SIGMETs)** across **Past (-7 days), Live (Now), and Future (+7 days)** timeframes.
 
 ### Architectural Rules
 1. **Zero Backend Servers / Zero Paid APIs:** The frontend is a static bundle deployed to GitHub Pages. All upstream API fetching, decompression, coordinate regex parsing, and historical archiving run in a scheduled **GitHub Actions cron job** every 15 minutes.
 2. **Git-Backed Data Feed (`data-feed` branch):** The ingestion script writes a unified `alerts.geojson` file and publishes it to an orphan branch named `data-feed` (`force_orphan: true`) so git history never bloats and frontend rebuilds are not triggered on every data update.
-3. **60fps Client-Side Temporal Scrubbing:** The frontend loads `alerts.geojson` once into a MapLibre GL JS source and uses GPU-accelerated style filter expressions (`map.setFilter`) to scrub instantly across past, live, and future timestamps.
+3. **Responsive Client-Side Temporal Scrubbing:** The frontend loads `alerts.geojson` into a MapLibre GL JS source, periodically checks for a newer snapshot, and uses style filters (`map.setFilter`) to scrub across past, live, and future timestamps.
 4. **Resilient Fallbacks:** If an upstream API fails during a cron run, log a warning and retain existing cached records from the previous run rather than crashing the pipeline.
 
 ---
@@ -277,7 +287,7 @@ export function parseNgaCancelTimestamp(rawText: string): number | null {
 
 ---
 
-## 8. MapLibre GL JS & 60fps Temporal Filter (`src/components/MapCanvas.ts`)
+## 8. MapLibre GL JS Temporal Filter (`src/components/MapCanvas.ts`)
 1. Initialize `maplibregl.Map` with `style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"`, centered at `[0, 25]`, zoom `2.2`.
 2. Load the GeoJSON feed URL:
    * In production, fetch `https://raw.githubusercontent.com/<owner>/<repo>/data-feed/alerts.geojson` (or configure via `import.meta.env.VITE_DATA_FEED_URL` with fallback to `./alerts.geojson`).
@@ -288,7 +298,7 @@ export function parseNgaCancelTimestamp(rawText: string): number | null {
      * Color by `domain`: `"notam"` -> `#f87171`, `"maritime"` -> `#60a5fa`, `"weather"` -> `#fbbf24`. `line-width: 2`.
    * `hazards-points` (`type: "circle"`, `filter: ["==", ["geometry-type"], "Point"]`)
      * Color by `severity`: `"danger"` -> `#ef4444`, `"warning"` -> `#f59e0b`, `"info"` -> `#10b981`. `circle-radius: 6`, `circle-stroke-width: 1.5`, `circle-stroke-color: "#0f172a"`.
-4. Implement instant GPU filtering whenever the timeline slider or domain/severity pills change:
+4. Apply MapLibre style filters when the timeline slider or domain/severity pills change:
 
 ```typescript
 export function applyMapFilters(

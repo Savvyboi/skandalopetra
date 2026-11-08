@@ -2,14 +2,12 @@ import type { Feature, FeatureCollection, Geometry } from "geojson";
 
 export type HazardDomain = "notam" | "maritime" | "weather";
 
-export type HazardSubType =
-  | "TFR"
-  | "NOTAM"
-  | "NAVAREA"
-  | "NAVTEX"
-  | "SIGMET"
-  | "METAR"
-  | "TAF";
+export const HAZARD_SUB_TYPES = [
+  "NOTAM", "TFR", "NAVAREA", "NAVTEX", "NAVWARN", "MARINE WEATHER",
+  "SIGMET", "AIRMET", "CWA", "METAR", "TAF", "NWS ALERT",
+] as const;
+
+export type HazardSubType = (typeof HAZARD_SUB_TYPES)[number];
 
 export type HazardSeverity = "info" | "warning" | "danger";
 
@@ -41,6 +39,8 @@ export interface AlertFeatureProperties {
   validTo: number;            // Unix timestamp in seconds (end of effective window)
   altitudeMinFt?: number;     // Optional lower altitude limit in feet MSL
   altitudeMaxFt?: number;     // Optional upper altitude limit in feet MSL
+  sourceUrl?: string;        // Official bulletin or product page
+  geometryNote?: string;     // Explanation for approximate or representative geometry
 }
 
 export type HazardFeature = Feature<Geometry, AlertFeatureProperties>;

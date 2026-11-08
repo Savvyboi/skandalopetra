@@ -4,6 +4,7 @@ import { XMLParser } from "fast-xml-parser";
 import type { Geometry } from "geojson";
 import type { HazardFeature, HazardSeverity } from "../../src/types/schema.ts";
 import {
+  closePolygonRings,
   computeDurationHours,
   computeGeometryAreaSqKm,
 } from "../utils/geometry.ts";
@@ -14,6 +15,10 @@ const FETCH_HEADERS = {
   "User-Agent": USER_AGENT,
   Accept: "application/json, application/xml, text/csv, */*",
 };
+
+type ReportCallback = (
+  product: "METAR" | "TAF", station: string, issuedAt: number, effectiveAt: number
+) => void;
 
 function toUnixSec(val: unknown): number | null {
   if (typeof val === "number" && Number.isFinite(val)) {
@@ -35,40 +40,41 @@ function toUnixSec(val: unknown): number | null {
 
 function isValidGeometry(geom: unknown): geom is Geometry {
   if (!geom || typeof geom !== "object") return false;
-  const g = geom as { type?: string; coordinates?: unknown[] };
-  if (!g.type || !Array.isArray(g.coordinates) || g.coordinates.length === 0) {
-    return false;
+  const { type, coordinates } = geom as { type?: string; coordinates?: unknown };
+  const position = (p: unknown) => Array.isArray(p) &&
+    Number.isFinite(p[0]) && Number.isFinite(p[1]) && Math.abs(p[1]) <= 90;
+  const ring = (r: unknown) => Array.isArray(r) && r.length >= 3 && r.every(position) &&
+    new Set(r.map((p) => `${p[0]},${p[1]}`)).size >= 3;
+  const polygon = (p: unknown) => Array.isArray(p) && p.length > 0 && p.every(ring);
+  switch (type) {
+    case "Point": return position(coordinates);
+    case "LineString": return Array.isArray(coordinates) && coordinates.length >= 2 && coordinates.every(position);
+    case "Polygon": return polygon(coordinates);
+    case "MultiPolygon": return Array.isArray(coordinates) && coordinates.length > 0 && coordinates.every(polygon);
+    default: return false;
   }
-  if (g.type === "Polygon") {
-    const ring = g.coordinates[0];
-    return Array.isArray(ring) && ring.length >= 4;
-  }
-  return true;
 }
 
-async function fetchSigmets(nowSec: number): Promise<HazardFeature[]> {
+async function fetchAviationAdvisories(): Promise<HazardFeature[]> {
   const endpoints = [
-    {
-      name: "ISIGMET",
-      url: "https://aviationweather.gov/api/data/isigmet?format=geojson",
-    },
-    {
-      name: "AIRSIGMET",
-      url: "https://aviationweather.gov/api/data/airsigmet?format=geojson",
-    },
-  ];
+    { name: "ISIGMET", subType: "SIGMET" },
+    { name: "AIRSIGMET", subType: "SIGMET" },
+    { name: "CWA", subType: "CWA" },
+    { name: "AIRMET", subType: "AIRMET" },
+  ] as const;
 
-  const results: HazardFeature[] = [];
-
-  for (const ep of endpoints) {
+  const batches = await Promise.all(endpoints.map(async (ep) => {
+    const results: HazardFeature[] = [];
     try {
-      const res = await fetch(ep.url, {
+      const url = `https://aviationweather.gov/api/data/${ep.name.toLowerCase()}?format=geojson`;
+      const res = await fetch(url, {
         headers: FETCH_HEADERS,
         signal: AbortSignal.timeout(25000),
       });
+      if (res.status === 204) return results;
       if (!res.ok) {
         console.warn(`[awcWeather] ${ep.name} HTTP ${res.status}`);
-        continue;
+        return results;
       }
       const fc = (await res.json()) as {
         features?: Array<{
@@ -76,30 +82,33 @@ async function fetchSigmets(nowSec: number): Promise<HazardFeature[]> {
           properties?: Record<string, unknown>;
         }>;
       };
-      if (!Array.isArray(fc.features)) continue;
+      if (!Array.isArray(fc.features)) return results;
 
       for (const item of fc.features) {
         if (!isValidGeometry(item.geometry) || !item.properties) continue;
         const p = item.properties;
+        const geometry = closePolygonRings(item.geometry);
 
-        const validFrom = toUnixSec(p.validTimeFrom) ?? nowSec;
-        const validTo = toUnixSec(p.validTimeTo) ?? validFrom + 14400;
+        const validFrom = toUnixSec(p.validTimeFrom);
+        const validTo = toUnixSec(p.validTimeTo);
+        if (validFrom === null || validTo === null || validTo <= validFrom) continue;
 
         const hazard = String(
-          p.hazard ?? p.airSigmetType ?? "SIGMET"
+          p.hazard ?? p.airSigmetType ?? ep.subType
         ).toUpperCase();
         const qualifier = String(p.qualifier ?? "").toUpperCase();
+        const firOrStation = String(
+          p.firId ?? p.icaoId ?? p.cwsu ?? p.zone ?? ""
+        ).toUpperCase();
+        if (!firOrStation) continue;
+        const seriesId = String(
+          p.seriesId ?? p.alphaChar ?? (ep.name === "AIRMET" ? hazard : validFrom)
+        ).replace(/\s+/g, "-");
         const rawText = String(
-          p.rawSigmet ?? p.rawAirSigmet ?? p.rawText ?? ""
+          p.rawSigmet ?? p.rawAirSigmet ?? p.cwaText ?? p.rawText ??
+          (ep.name === "AIRMET" ? `${hazard} for ${firOrStation} (AWC decoded AIRMET)` : "")
         ).trim();
         if (!rawText) continue;
-
-        const firOrStation = String(
-          p.firId ?? p.icaoId ?? "KJFK"
-        ).toUpperCase();
-        const seriesId = String(
-          p.seriesId ?? p.alphaChar ?? validFrom
-        ).replace(/\s+/g, "-");
 
         const isDanger =
           hazard === "VA" ||
@@ -129,20 +138,22 @@ async function fetchSigmets(nowSec: number): Promise<HazardFeature[]> {
             : undefined;
 
         const meta = resolveIcaoMetadata(
-          ep.name === "AIRSIGMET" ? "KZNY" : firOrStation,
+          ep.name === "ISIGMET" ? firOrStation : "KZNY",
           "weather"
         );
 
         const id = `AWC-${ep.name}-${firOrStation}-${seriesId}-${validFrom}`;
-        const title = `${firOrStation} SIGMET ${seriesId} (${hazard})`;
+        const title = ep.name === "AIRMET"
+          ? `${firOrStation} AIRMET (${hazard})`
+          : `${firOrStation} ${ep.subType} ${seriesId} (${hazard})`;
 
         results.push({
           type: "Feature",
-          geometry: item.geometry,
+          geometry,
           properties: {
             id,
             domain: "weather",
-            subType: "SIGMET",
+            subType: ep.subType,
             severity,
             title,
             rawText,
@@ -150,11 +161,12 @@ async function fetchSigmets(nowSec: number): Promise<HazardFeature[]> {
             issuer: meta.issuer,
             country: meta.country,
             region: meta.region,
-            areaSqKm: computeGeometryAreaSqKm(item.geometry),
+            areaSqKm: computeGeometryAreaSqKm(geometry),
             durationHours: computeDurationHours(validFrom, validTo),
             issuedAt: validFrom,
             validFrom,
             validTo,
+            sourceUrl: ep.subType === "SIGMET" ? "https://aviationweather.gov/gfa/#sigmet" : url,
             ...(altitudeMinFt !== undefined ? { altitudeMinFt } : {}),
             ...(altitudeMaxFt !== undefined ? { altitudeMaxFt } : {}),
           },
@@ -166,12 +178,12 @@ async function fetchSigmets(nowSec: number): Promise<HazardFeature[]> {
         err instanceof Error ? err.message : err
       );
     }
-  }
-
-  return results;
+    return results;
+  }));
+  return batches.flat();
 }
 
-async function fetchMetars(nowSec: number): Promise<HazardFeature[]> {
+async function fetchMetars(onReport?: ReportCallback): Promise<HazardFeature[]> {
   const url = "https://aviationweather.gov/data/cache/metars.cache.csv.gz";
   const results: HazardFeature[] = [];
 
@@ -219,6 +231,9 @@ async function fetchMetars(nowSec: number): Promise<HazardFeature[]> {
       const stationId = (row.station_id ?? "").trim().toUpperCase();
       const rawText = (row.raw_text ?? "").trim();
       if (!stationId || !rawText) continue;
+      const obsSec = toUnixSec(row.observation_time);
+      if (obsSec === null) continue;
+      onReport?.("METAR", stationId, obsSec, obsSec);
 
       const lat = parseFloat(row.latitude ?? "");
       const lon = parseFloat(row.longitude ?? "");
@@ -253,7 +268,6 @@ async function fetchMetars(nowSec: number): Promise<HazardFeature[]> {
         wxDangerRegex.test(wxString);
 
       const severity: HazardSeverity = isDanger ? "danger" : "warning";
-      const obsSec = toUnixSec(row.observation_time) ?? nowSec;
       const validFrom = obsSec;
       const validTo = obsSec + 5400; // 90 minutes
 
@@ -315,7 +329,7 @@ function parseVisibilitySm(visRaw: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-async function fetchTafs(nowSec: number): Promise<HazardFeature[]> {
+async function fetchTafs(onReport?: ReportCallback): Promise<HazardFeature[]> {
   const url = "https://aviationweather.gov/data/cache/tafs.cache.xml.gz";
   const results: HazardFeature[] = [];
 
@@ -369,11 +383,14 @@ async function fetchTafs(nowSec: number): Promise<HazardFeature[]> {
       }
 
       const issuedAt =
-        toUnixSec(taf.issue_time) ?? toUnixSec(taf.bulletin_time) ?? nowSec;
+        toUnixSec(taf.issue_time) ?? toUnixSec(taf.bulletin_time);
+      if (issuedAt === null) continue;
       const meta = resolveIcaoMetadata(stationId, "weather");
       const forecasts = asArray(
         taf.forecast as Record<string, unknown> | Array<Record<string, unknown>>
       );
+      const effectiveAt = toUnixSec(taf.valid_time_from) ?? toUnixSec(forecasts[0]?.fcst_time_from);
+      if (effectiveAt !== null) onReport?.("TAF", stationId, issuedAt, Math.max(issuedAt, effectiveAt));
 
       for (const fcst of forecasts) {
         const validFrom = toUnixSec(fcst.fcst_time_from);
@@ -461,9 +478,6 @@ async function fetchTafs(nowSec: number): Promise<HazardFeature[]> {
             issuedAt,
             validFrom,
             validTo,
-            ...(minCeilingFt !== null
-              ? { altitudeMaxFt: Math.round(minCeilingFt) }
-              : {}),
           },
         });
       }
@@ -479,15 +493,15 @@ async function fetchTafs(nowSec: number): Promise<HazardFeature[]> {
 }
 
 export async function fetchAwcWeatherHazards(
-  nowSec: number
+  onReport?: ReportCallback
 ): Promise<HazardFeature[]> {
-  const [sigmets, metars, tafs] = await Promise.all([
-    fetchSigmets(nowSec),
-    fetchMetars(nowSec),
-    fetchTafs(nowSec),
+  const [advisories, metars, tafs] = await Promise.all([
+    fetchAviationAdvisories(),
+    fetchMetars(onReport),
+    fetchTafs(onReport),
   ]);
   console.log(
-    `[awcWeather] Parsed ${sigmets.length} SIGMETs, ${metars.length} METARs, ${tafs.length} TAF windows`
+    `[awcWeather] Parsed ${advisories.length} aviation weather advisories, ${metars.length} METARs, ${tafs.length} TAF windows`
   );
-  return [...sigmets, ...metars, ...tafs];
+  return [...advisories, ...metars, ...tafs];
 }
