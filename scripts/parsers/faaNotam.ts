@@ -1,10 +1,13 @@
 import type { Geometry } from "geojson";
 import type { HazardFeature, HazardSeverity } from "../../src/types/schema.ts";
 import {
+  computeDurationHours,
+  computeGeometryAreaSqKm,
   coordsToGeoJsonGeometry,
   createNmCircleGeometry,
   parseNotamQLineCircle,
 } from "../utils/geometry.ts";
+import { resolveIcaoMetadata } from "../utils/icaoRegions.ts";
 
 const USER_AGENT = "GlobalHazardTracker/1.0 (+https://github.com)";
 const FETCH_HEADERS = {
@@ -63,7 +66,6 @@ function htmlTableToCleanText(html: string): string {
 }
 
 function parseFaaHumanUtcDate(str: string): number | undefined {
-  // Matches e.g. "November 08, 2026 at 0900 UTC" or "May 6, 2025 at 1430 EDT"
   const m =
     /([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})\s+at\s+(\d{2})(\d{2})\s*([A-Z]{2,4})?/i.exec(
       str
@@ -150,7 +152,6 @@ function parseAltitudes(text: string): {
 }
 
 function parseDmsGeometryFromWebText(cleanText: string): Geometry | null {
-  // Matches e.g.: Latitude: 28º01'52"N, Longitude: 81º46'52"W
   const dmsRegex =
     /Latitude:\s*(\d{1,2})[^\d]+(\d{1,2})'([\d.]+)"\s*([NS]),\s*Longitude:\s*(\d{1,3})[^\d]+(\d{1,2})'([\d.]+)"\s*([EW])/gi;
   const coords: [number, number][] = [];
@@ -295,7 +296,6 @@ async function fetchUnauthenticatedFaaTfrs(
     const tfrItems = (await listRes.json()) as FaaTfrListItem[];
     if (!Array.isArray(tfrItems)) return features;
 
-    // Fetch web text in small batches of 10 so we don't overwhelm FAA servers
     const detailsMap = new Map<string, ParsedWebTextInfo>();
     const batchSize = 10;
     for (let i = 0; i < tfrItems.length; i += batchSize) {
@@ -352,6 +352,8 @@ async function fetchUnauthenticatedFaaTfrs(
           item.description ?? "N/A"
         }\nCreated: ${item.creation_date ?? "N/A"}`;
 
+      const durationHours = computeDurationHours(validFrom, validTo);
+
       geometries.forEach((geom, idx) => {
         const suffix = idx === 0 ? "" : `-AREA-${idx + 1}`;
         features.push({
@@ -368,6 +370,11 @@ async function fetchUnauthenticatedFaaTfrs(
                 : title,
             rawText,
             stationOrArea: facility,
+            issuer: "FAA (US)",
+            country: "United States",
+            region: "North America",
+            areaSqKm: computeGeometryAreaSqKm(geom),
+            durationHours,
             issuedAt,
             validFrom,
             validTo,
@@ -483,6 +490,8 @@ async function fetchAuthenticatedFaaNotams(
           ? "danger"
           : "warning";
 
+      const meta = resolveIcaoMetadata(icaoLocation, "notam");
+
       features.push({
         type: "Feature",
         geometry,
@@ -494,6 +503,11 @@ async function fetchAuthenticatedFaaNotams(
           title: `${icaoLocation} NOTAM ${notam.number ?? idNum}`,
           rawText,
           stationOrArea: icaoLocation,
+          issuer: meta.issuer,
+          country: meta.country,
+          region: meta.region,
+          areaSqKm: computeGeometryAreaSqKm(geometry),
+          durationHours: computeDurationHours(validFrom, validTo),
           issuedAt,
           validFrom,
           validTo,

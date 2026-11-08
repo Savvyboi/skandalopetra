@@ -7,13 +7,14 @@ A zero-backend, zero-paid-API, open-source static web application hosted on **Gi
 1. **Scheduled GitHub Actions Ingestion (`.github/workflows/ingest-data.yml`):**
    - Runs every 15 minutes on Node.js 22.
    - Fetches, decompresses, and normalizes:
+     - **Global ICAO Aviation NOTAMs & U.S. FAA TFRs:** Worldwide ICAO Q-line NOTAMs across Europe, Middle East, Africa, Asia-Pacific, Oceania, Canada (`NAV CANADA CFPS`), Latin America, and North Atlantic FIRs (`FAA Global NOTAM Search` + optional authenticated `FAA External NOTAM API`), alongside GeoServer WFS polygons + verbatim FDC text for U.S. Temporary Flight Restrictions (`TFR`).
+     - **Multi-Source Global Maritime Warnings (`NAVAREA` & `NAVTEX`):** Live global navigational and marine warnings aggregated concurrently from **UKHO Admiralty** (`NAVAREA I` & UK Coastal `WZ`), **Danish Maritime Authority Niord** (Baltic & North Sea GeoJSON), **Hellenic Navy Hydrographic Service — HNHS** (`NAVAREA III` Mediterranean/Aegean), **Japan Coast Guard JHOD** (`NAVAREA XI` & NW Pacific/SE Asia `NAVTEX`), **U.S. NGA MSI**, and **18 WMO/GTS High Seas & Marine Bulletins** (`NOAA OPC/NHC`, `DHN Brazil`, `SHN/SMN Argentina`, `DIRECTEMAR Chile`, `BoM Australia`, `MetService NZ`, `FMS Fiji`, `Météo-France NC`, and `JMA Japan`).
      - **NOAA Aviation Weather Center (AWC):** International & U.S. SIGMET polygons, global hazardous METAR observations (`IFR`/`LIFR`, winds/gusts ≥ 25 kt, or severe weather strings), and global TAF future forecast windows.
-     - **U.S. NGA MSI & WMO/IMO NAVAREA Broadcasts:** Global maritime navigational and high-seas warnings with Degrees-Decimal-Minutes coordinate geometry synthesis and static 21-NAVAREA (`I`–`XXI`) fallback polygons.
-     - **FAA TFRs & Optional FAA NOTAM API:** Active Temporary Flight Restriction airspaces (GeoServer WFS polygons + verbatim FDC text/altitudes) and optional authenticated ICAO Q-line NOTAMs.
-   - Merges live hazards into a rolling 7-day archive (`alerts.geojson`), prunes records older than 7 days, and publishes to an orphan `data-feed` branch (`force_orphan: true`) so `main` commit history stays lean.
+   - Enriches every feature with **Issuing Authority**, **Country / Ocean**, **Global Region**, **Spherical Footprint Area ($\text{km}^2$)**, and **Effective Duration (hours)**, merges into a rolling 7-day archive (`alerts.geojson`), and publishes to an orphan `data-feed` branch (`force_orphan: true`) so `main` commit history stays lean.
 2. **60fps GPU-Filtered MapLibre Frontend (`src/`):**
    - Loads `alerts.geojson` once into a MapLibre GL JS source over Carto Dark Matter vector tiles.
-   - Uses GPU expression filters (`map.setFilter`) to scrub smoothly across `-7d` archive, `Live` current hazards, and `+7d` forecast windows in 15-minute increments.
+   - Uses GPU expression filters (`map.setFilter`) to scrub smoothly across `-7d` archive, `Live` current hazards, and `+7d` forecast windows in 15-minute increments, plus instant client-side filtering by **Domain**, **Sub-Type** (`NOTAM`, `TFR`, `NAVAREA`, `NAVTEX`, `SIGMET`, `METAR`, `TAF`), **Severity**, **Global Region**, **Issuing Authority**, **Footprint Size**, **Issued Recency**, and **Duration**.
+   - Sorts overlapping polygons smallest-on-top (`fill-sort-key` + specificity hit-testing) so pinpoint coastal/airspace hazards remain clickable inside regional advisories.
    - Fetches live wave height, swell period, and 72-hour peak wave forecasts on demand from **Open-Meteo Marine API** when inspecting maritime advisories.
 
 ## Local Development

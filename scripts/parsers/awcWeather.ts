@@ -3,6 +3,11 @@ import { parse } from "csv-parse/sync";
 import { XMLParser } from "fast-xml-parser";
 import type { Geometry } from "geojson";
 import type { HazardFeature, HazardSeverity } from "../../src/types/schema.ts";
+import {
+  computeDurationHours,
+  computeGeometryAreaSqKm,
+} from "../utils/geometry.ts";
+import { resolveIcaoMetadata } from "../utils/icaoRegions.ts";
 
 const USER_AGENT = "GlobalHazardTracker/1.0 (+https://github.com)";
 const FETCH_HEADERS = {
@@ -90,7 +95,7 @@ async function fetchSigmets(nowSec: number): Promise<HazardFeature[]> {
         if (!rawText) continue;
 
         const firOrStation = String(
-          p.firId ?? p.icaoId ?? "GLOBAL"
+          p.firId ?? p.icaoId ?? "KJFK"
         ).toUpperCase();
         const seriesId = String(
           p.seriesId ?? p.alphaChar ?? validFrom
@@ -123,6 +128,11 @@ async function fetchSigmets(nowSec: number): Promise<HazardFeature[]> {
             ? Number(altHighRaw)
             : undefined;
 
+        const meta = resolveIcaoMetadata(
+          ep.name === "AIRSIGMET" ? "KZNY" : firOrStation,
+          "weather"
+        );
+
         const id = `AWC-${ep.name}-${firOrStation}-${seriesId}-${validFrom}`;
         const title = `${firOrStation} SIGMET ${seriesId} (${hazard})`;
 
@@ -137,6 +147,11 @@ async function fetchSigmets(nowSec: number): Promise<HazardFeature[]> {
             title,
             rawText,
             stationOrArea: firOrStation,
+            issuer: meta.issuer,
+            country: meta.country,
+            region: meta.region,
+            areaSqKm: computeGeometryAreaSqKm(item.geometry),
+            durationHours: computeDurationHours(validFrom, validTo),
             issuedAt: validFrom,
             validFrom,
             validTo,
@@ -250,6 +265,7 @@ async function fetchMetars(nowSec: number): Promise<HazardFeature[]> {
 
       const summaryTag = badgeParts.join(" ") || "HAZARD";
       const title = `${stationId} ${summaryTag} METAR`;
+      const meta = resolveIcaoMetadata(stationId, "weather");
 
       results.push({
         type: "Feature",
@@ -265,6 +281,11 @@ async function fetchMetars(nowSec: number): Promise<HazardFeature[]> {
           title,
           rawText,
           stationOrArea: stationId,
+          issuer: meta.issuer,
+          country: meta.country,
+          region: meta.region,
+          areaSqKm: 0,
+          durationHours: 1.5,
           issuedAt: obsSec,
           validFrom,
           validTo,
@@ -349,6 +370,7 @@ async function fetchTafs(nowSec: number): Promise<HazardFeature[]> {
 
       const issuedAt =
         toUnixSec(taf.issue_time) ?? toUnixSec(taf.bulletin_time) ?? nowSec;
+      const meta = resolveIcaoMetadata(stationId, "weather");
       const forecasts = asArray(
         taf.forecast as Record<string, unknown> | Array<Record<string, unknown>>
       );
@@ -431,6 +453,11 @@ async function fetchTafs(nowSec: number): Promise<HazardFeature[]> {
             title,
             rawText,
             stationOrArea: stationId,
+            issuer: meta.issuer,
+            country: meta.country,
+            region: meta.region,
+            areaSqKm: 0,
+            durationHours: computeDurationHours(validFrom, validTo),
             issuedAt,
             validFrom,
             validTo,

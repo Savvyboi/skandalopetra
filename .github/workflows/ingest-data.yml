@@ -3,6 +3,11 @@ name: Update Global Hazard Feed
 on:
   schedule:
     - cron: "*/15 * * * *"
+  push:
+    branches: ["main"]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/ingest-data.yml"
   workflow_dispatch:
 
 permissions:

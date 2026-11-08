@@ -7,9 +7,73 @@ import type {
 } from "../src/types/schema.ts";
 import { fetchAwcWeatherHazards } from "./parsers/awcWeather.ts";
 import { fetchFaaNotamHazards } from "./parsers/faaNotam.ts";
+import { fetchGlobalIcaoNotams } from "./parsers/globalNotam.ts";
 import { fetchNgaMaritimeHazards } from "./parsers/ngaMaritime.ts";
+import {
+  computeDurationHours,
+  computeGeometryAreaSqKm,
+} from "./utils/geometry.ts";
+import {
+  resolveIcaoMetadata,
+  resolveNavAreaMetadata,
+} from "./utils/icaoRegions.ts";
 
 const USER_AGENT = "GlobalHazardTracker/1.0 (+https://github.com)";
+
+function backfillArchiveFeature(feat: HazardFeature): HazardFeature {
+  const p = feat.properties;
+  if (
+    p.issuer &&
+    p.country &&
+    p.region &&
+    typeof p.areaSqKm === "number" &&
+    typeof p.durationHours === "number"
+  ) {
+    return feat;
+  }
+
+  const meta =
+    p.domain === "maritime"
+      ? resolveNavAreaMetadata(p.stationOrArea)
+      : p.subType === "TFR"
+      ? {
+          issuer: "FAA (US)",
+          country: "United States",
+          region: "North America" as const,
+        }
+      : resolveIcaoMetadata(p.stationOrArea, p.domain);
+
+  return {
+    ...feat,
+    properties: {
+      ...p,
+      issuer: p.issuer || meta.issuer,
+      country: p.country || meta.country,
+      region: p.region || meta.region,
+      areaSqKm:
+        typeof p.areaSqKm === "number"
+          ? p.areaSqKm
+          : computeGeometryAreaSqKm(feat.geometry),
+      durationHours:
+        typeof p.durationHours === "number"
+          ? p.durationHours
+          : computeDurationHours(p.validFrom, p.validTo),
+    },
+  };
+}
+
+function isLegacyWholeOceanFallback(feat: HazardFeature): boolean {
+  const p = feat.properties;
+  if (p.id.endsWith("-BULLETIN")) return true;
+  if (p.id.startsWith("WMO-NAVAREA-")) {
+    const area =
+      typeof p.areaSqKm === "number"
+        ? p.areaSqKm
+        : computeGeometryAreaSqKm(feat.geometry);
+    if (area > 8_000_000) return true;
+  }
+  return false;
+}
 
 async function loadExistingArchive(
   repoOwnerAndName: string,
@@ -28,14 +92,14 @@ async function loadExistingArchive(
       const data = (await res.json()) as Partial<HazardFeatureCollection>;
       if (Array.isArray(data.features)) {
         for (const feat of data.features) {
-          if (feat?.properties?.id) {
-            archive.set(feat.properties.id, feat);
+          if (feat?.properties?.id && feat.geometry) {
+            if (isLegacyWholeOceanFallback(feat)) continue;
+            archive.set(feat.properties.id, backfillArchiveFeature(feat));
           }
         }
         console.log(
           `[ingest] Loaded ${archive.size} cached features from ${archiveUrl}`
         );
-        return archive;
       }
     } else if (res.status === 404) {
       console.log(
@@ -57,17 +121,22 @@ async function loadExistingArchive(
     const rawLocal = await fs.readFile(localFallbackPath, "utf8");
     const parsed = JSON.parse(rawLocal) as Partial<HazardFeatureCollection>;
     if (Array.isArray(parsed.features)) {
+      let addedLocal = 0;
       for (const feat of parsed.features) {
-        if (feat?.properties?.id) {
-          archive.set(feat.properties.id, feat);
+        if (feat?.properties?.id && feat.geometry) {
+          if (isLegacyWholeOceanFallback(feat)) continue;
+          archive.set(feat.properties.id, backfillArchiveFeature(feat));
+          addedLocal++;
         }
       }
-      console.log(
-        `[ingest] Loaded ${archive.size} cached features from local ${localFallbackPath}`
-      );
+      if (addedLocal > 0) {
+        console.log(
+          `[ingest] Merged ${addedLocal} local cached features -> ${archive.size} total archive entries`
+        );
+      }
     }
   } catch {
-    // No local cache yet — start fresh
+    // No local cache yet — proceed with remote archive
   }
 
   return archive;
@@ -85,7 +154,11 @@ async function main(): Promise<void> {
   const outPath = path.join(distDataDir, "alerts.geojson");
   const publicFallbackPath = path.join(rootDir, "public", "alerts.geojson");
 
-  console.log(`[ingest] Starting hazard ingestion at ${new Date(now * 1000).toISOString()}`);
+  console.log(
+    `[ingest] Starting global hazard ingestion at ${new Date(
+      now * 1000
+    ).toISOString()}`
+  );
 
   const featureMap = await loadExistingArchive(repoOwnerAndName, outPath);
 
@@ -93,9 +166,15 @@ async function main(): Promise<void> {
     fetchAwcWeatherHazards(now),
     fetchNgaMaritimeHazards(now),
     fetchFaaNotamHazards(now),
+    fetchGlobalIcaoNotams(now),
   ]);
 
-  const parserNames = ["awcWeather", "ngaMaritime", "faaNotam"];
+  const parserNames = [
+    "awcWeather",
+    "ngaMaritime",
+    "faaNotam",
+    "globalNotam",
+  ];
   parserJobs.forEach((result, idx) => {
     const name = parserNames[idx];
     if (result.status === "fulfilled") {
@@ -120,9 +199,12 @@ async function main(): Promise<void> {
   }
 
   const countsByDomain = { notam: 0, maritime: 0, weather: 0 };
+  const countsByRegion: Record<string, number> = {};
   for (const f of activeFeatures) {
     countsByDomain[f.properties.domain] =
       (countsByDomain[f.properties.domain] ?? 0) + 1;
+    countsByRegion[f.properties.region] =
+      (countsByRegion[f.properties.region] ?? 0) + 1;
   }
 
   const collection: HazardFeatureCollection = {
@@ -147,6 +229,7 @@ async function main(): Promise<void> {
   console.log(
     `[ingest] Wrote ${activeFeatures.length} features (${sizeMb} MB) -> notam=${countsByDomain.notam}, maritime=${countsByDomain.maritime}, weather=${countsByDomain.weather}`
   );
+  console.log(`[ingest] Regional breakdown:`, countsByRegion);
 }
 
 main().catch((err) => {

@@ -4,13 +4,19 @@ import {
   NavigationControl,
   Popup,
   setWorkerUrl,
+  type MapGeoJSONFeature,
   type MapMouseEvent,
 } from "maplibre-gl";
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import type {
   AlertFeatureProperties,
   HazardFeatureCollection,
+  HazardRegion,
 } from "../types/schema";
+import type {
+  DurationFilterPreset,
+  SizeFilterPreset,
+} from "./FilterPills";
 
 setWorkerUrl(new URL(maplibreWorkerUrl, window.location.href).href);
 
@@ -22,6 +28,20 @@ const HAZARD_LAYERS = [
   "hazards-outline",
   "hazards-fill",
 ] as const;
+
+export interface MapFilterCriteria {
+  timestampSec: number;
+  referenceNowSec: number;
+  domains: string[];
+  subTypes: string[];
+  severities: string[];
+  region: HazardRegion | "all";
+  issuer: string;
+  sizePreset: SizeFilterPreset;
+  recencyHours: number;
+  durationPreset: DurationFilterPreset;
+  searchQuery: string;
+}
 
 export interface SelectedMapHazard {
   properties: AlertFeatureProperties;
@@ -36,27 +56,97 @@ export interface MapCanvasCallbacks {
 
 export function applyMapFilters(
   map: MapLibreMap,
-  selectedTimestampSec: number,
-  activeDomains: string[],
-  activeSeverities: string[],
-  searchQuery: string
+  criteria: MapFilterCriteria
 ): void {
   if (!map.getLayer("hazards-fill")) return;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const baseConditions: any[] = [
-    ["in", ["get", "domain"], ["literal", activeDomains]],
-    ["in", ["get", "severity"], ["literal", activeSeverities]],
-    ["<=", ["get", "validFrom"], selectedTimestampSec],
-    [">=", ["get", "validTo"], selectedTimestampSec],
+    ["in", ["get", "domain"], ["literal", criteria.domains]],
+    ["in", ["get", "subType"], ["literal", criteria.subTypes]],
+    ["in", ["get", "severity"], ["literal", criteria.severities]],
+    ["<=", ["get", "validFrom"], criteria.timestampSec],
+    [">=", ["get", "validTo"], criteria.timestampSec],
   ];
 
-  if (searchQuery.trim().length > 0) {
-    const q = searchQuery.trim().toUpperCase();
+  if (criteria.region !== "all") {
+    baseConditions.push([
+      "==",
+      ["coalesce", ["get", "region"], ""],
+      criteria.region,
+    ]);
+  }
+
+  if (criteria.issuer !== "all") {
+    baseConditions.push([
+      "==",
+      ["coalesce", ["get", "issuer"], ""],
+      criteria.issuer,
+    ]);
+  }
+
+  // Area / Footprint Size GPU Expressions
+  const areaExpr = ["coalesce", ["get", "areaSqKm"], 0];
+  switch (criteria.sizePreset) {
+    case "no-giant":
+      baseConditions.push(["<=", areaExpr, 200000]);
+      break;
+    case "point":
+      baseConditions.push(["<", areaExpr, 10]);
+      break;
+    case "local":
+      baseConditions.push([">=", areaExpr, 10]);
+      baseConditions.push(["<=", areaExpr, 1000]);
+      break;
+    case "regional":
+      baseConditions.push([">", areaExpr, 1000]);
+      baseConditions.push(["<=", areaExpr, 50000]);
+      break;
+    case "large":
+      baseConditions.push([">", areaExpr, 50000]);
+      break;
+    case "all":
+    default:
+      break;
+  }
+
+  // Issued Recency GPU Expression
+  if (criteria.recencyHours > 0) {
+    const minIssuedSec =
+      criteria.referenceNowSec - criteria.recencyHours * 3600;
+    baseConditions.push([
+      ">=",
+      ["coalesce", ["get", "issuedAt"], 0],
+      minIssuedSec,
+    ]);
+  }
+
+  // Effective Duration GPU Expression
+  const durExpr = ["coalesce", ["get", "durationHours"], 0];
+  switch (criteria.durationPreset) {
+    case "short":
+      baseConditions.push(["<", durExpr, 6]);
+      break;
+    case "medium":
+      baseConditions.push([">=", durExpr, 6]);
+      baseConditions.push(["<=", durExpr, 48]);
+      break;
+    case "long":
+      baseConditions.push([">", durExpr, 48]);
+      break;
+    case "all":
+    default:
+      break;
+  }
+
+  if (criteria.searchQuery.trim().length > 0) {
+    const q = criteria.searchQuery.trim().toUpperCase();
     baseConditions.push([
       "any",
       ["in", q, ["upcase", ["coalesce", ["get", "title"], ""]]],
       ["in", q, ["upcase", ["coalesce", ["get", "stationOrArea"], ""]]],
+      ["in", q, ["upcase", ["coalesce", ["get", "issuer"], ""]]],
+      ["in", q, ["upcase", ["coalesce", ["get", "country"], ""]]],
       ["in", q, ["upcase", ["coalesce", ["get", "rawText"], ""]]],
     ]);
   }
@@ -107,7 +197,11 @@ async function fetchHazardCollection(): Promise<HazardFeatureCollection> {
       const res = await fetch(bustUrl);
       if (!res.ok) continue;
       const json = (await res.json()) as HazardFeatureCollection;
-      if (json && json.type === "FeatureCollection" && Array.isArray(json.features)) {
+      if (
+        json &&
+        json.type === "FeatureCollection" &&
+        Array.isArray(json.features)
+      ) {
         return json;
       }
     } catch {
@@ -115,7 +209,9 @@ async function fetchHazardCollection(): Promise<HazardFeatureCollection> {
     }
   }
 
-  throw new Error("Unable to load hazard GeoJSON feed from remote or local cache.");
+  throw new Error(
+    "Unable to load hazard GeoJSON feed from remote or local cache."
+  );
 }
 
 function normalizeFeatureProperties(
@@ -132,6 +228,11 @@ function normalizeFeatureProperties(
       raw.stationOrArea !== undefined && raw.stationOrArea !== null
         ? String(raw.stationOrArea)
         : undefined,
+    issuer: String(raw.issuer ?? "Unknown Authority"),
+    country: String(raw.country ?? "Global"),
+    region: (raw.region as AlertFeatureProperties["region"]) ?? "High Seas",
+    areaSqKm: Number(raw.areaSqKm ?? 0),
+    durationHours: Number(raw.durationHours ?? 0),
     issuedAt: Number(raw.issuedAt ?? 0),
     validFrom: Number(raw.validFrom ?? 0),
     validTo: Number(raw.validTo ?? 0),
@@ -146,30 +247,48 @@ function normalizeFeatureProperties(
   };
 }
 
+/**
+ * Prioritizes Point features first, then LineStrings, then smaller Polygons before huge regional boxes
+ * so hovering/clicking an overlapping pinpoint hazard never gets blocked by a large background polygon.
+ */
+function pickMostSpecificHit(hits: MapGeoJSONFeature[]): MapGeoJSONFeature {
+  if (hits.length <= 1) return hits[0];
+  const sorted = [...hits].sort((a, b) => {
+    const rankGeom = (t: string) =>
+      t === "Point" || t === "MultiPoint"
+        ? 0
+        : t === "LineString" || t === "MultiLineString"
+        ? 1
+        : 2;
+    const ra = rankGeom(a.geometry.type);
+    const rb = rankGeom(b.geometry.type);
+    if (ra !== rb) return ra - rb;
+    const areaA = Number(a.properties?.areaSqKm ?? 0);
+    const areaB = Number(b.properties?.areaSqKm ?? 0);
+    return areaA - areaB;
+  });
+  return sorted[0];
+}
+
 export function initMapCanvas(
   container: HTMLElement,
-  initialFilterState: {
-    timestampSec: number;
-    domains: string[];
-    severities: string[];
-    searchQuery: string;
-  },
+  initialCriteria: MapFilterCriteria,
   callbacks: MapCanvasCallbacks
 ): {
   map: MapLibreMap;
-  updateFilters: (
-    timestampSec: number,
-    domains: string[],
-    severities: string[],
-    searchQuery: string
-  ) => void;
+  updateFilters: (criteria: MapFilterCriteria) => void;
 } {
-  let latestFilterState = { ...initialFilterState };
+  let latestCriteria: MapFilterCriteria = {
+    ...initialCriteria,
+    domains: [...initialCriteria.domains],
+    subTypes: [...initialCriteria.subTypes],
+    severities: [...initialCriteria.severities],
+  };
 
   const map = new MapLibreMap({
     container,
     style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-    center: [0, 25],
+    center: [12, 28],
     zoom: 2.2,
     minZoom: 1.2,
     maxZoom: 16,
@@ -190,7 +309,7 @@ export function initMapCanvas(
   const hoverPopup = new Popup({
     closeButton: false,
     closeOnClick: false,
-    maxWidth: "280px",
+    maxWidth: "300px",
     offset: 12,
     className: "hazard-hover-popup",
   });
@@ -229,6 +348,9 @@ export function initMapCanvas(
       type: "fill",
       source: "hazards",
       filter: ["in", ["geometry-type"], ["literal", ["Polygon", "MultiPolygon"]]],
+      layout: {
+        "fill-sort-key": ["-", 0, ["coalesce", ["get", "areaSqKm"], 0]],
+      },
       paint: {
         "fill-color": [
           "match",
@@ -241,7 +363,17 @@ export function initMapCanvas(
           "#f59e0b",
           "#94a3b8",
         ],
-        "fill-opacity": 0.22,
+        "fill-opacity": [
+          "interpolate",
+          ["linear"],
+          ["coalesce", ["get", "areaSqKm"], 0],
+          0,
+          0.28,
+          50000,
+          0.2,
+          500000,
+          0.11,
+        ],
       },
     });
 
@@ -266,7 +398,7 @@ export function initMapCanvas(
           "#fbbf24",
           "#cbd5e1",
         ],
-        "line-width": 2,
+        "line-width": 1.8,
       },
     });
 
@@ -278,28 +410,38 @@ export function initMapCanvas(
       paint: {
         "circle-color": [
           "match",
-          ["get", "severity"],
-          "danger",
+          ["get", "domain"],
+          "notam",
           "#ef4444",
-          "warning",
-          "#f59e0b",
-          "info",
-          "#10b981",
+          "maritime",
+          "#38bdf8",
+          "weather",
+          [
+            "match",
+            ["get", "severity"],
+            "danger",
+            "#ef4444",
+            "warning",
+            "#f59e0b",
+            "#10b981",
+          ],
           "#94a3b8",
         ],
-        "circle-radius": 6,
+        "circle-radius": [
+          "match",
+          ["get", "domain"],
+          "notam",
+          6.5,
+          "maritime",
+          6.5,
+          5.5,
+        ],
         "circle-stroke-width": 1.5,
         "circle-stroke-color": "#0f172a",
       },
     });
 
-    applyMapFilters(
-      map,
-      latestFilterState.timestampSec,
-      latestFilterState.domains,
-      latestFilterState.severities,
-      latestFilterState.searchQuery
-    );
+    applyMapFilters(map, latestCriteria);
 
     map.on("mousemove", (e: MapMouseEvent) => {
       const hits = map.queryRenderedFeatures(e.point, {
@@ -312,7 +454,7 @@ export function initMapCanvas(
       }
 
       map.getCanvas().style.cursor = "pointer";
-      const topHit = hits[0];
+      const topHit = pickMostSpecificHit(hits);
       const props = normalizeFeatureProperties(
         (topHit.properties ?? {}) as Record<string, unknown>
       );
@@ -322,7 +464,7 @@ export function initMapCanvas(
 
       const badgeRow = document.createElement("div");
       badgeRow.className = "hover-tooltip-meta";
-      badgeRow.textContent = `${props.subType} • ${props.severity.toUpperCase()}`;
+      badgeRow.textContent = `${props.subType} • ${props.issuer} • ${props.severity.toUpperCase()}`;
 
       const titleEl = document.createElement("div");
       titleEl.className = "hover-tooltip-title";
@@ -343,7 +485,7 @@ export function initMapCanvas(
       });
       if (hits.length === 0) return;
 
-      const selected = hits[0];
+      const selected = pickMostSpecificHit(hits);
       const props = normalizeFeatureProperties(
         (selected.properties ?? {}) as Record<string, unknown>
       );
@@ -366,14 +508,14 @@ export function initMapCanvas(
 
   return {
     map,
-    updateFilters(timestampSec, domains, severities, searchQuery) {
-      latestFilterState = {
-        timestampSec,
-        domains: [...domains],
-        severities: [...severities],
-        searchQuery,
+    updateFilters(criteria) {
+      latestCriteria = {
+        ...criteria,
+        domains: [...criteria.domains],
+        subTypes: [...criteria.subTypes],
+        severities: [...criteria.severities],
       };
-      applyMapFilters(map, timestampSec, domains, severities, searchQuery);
+      applyMapFilters(map, latestCriteria);
     },
   };
 }

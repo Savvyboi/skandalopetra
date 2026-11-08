@@ -22,6 +22,8 @@ function formatAltitudeRange(minFt?: number, maxFt?: number): string | null {
   const fmt = (ft: number) =>
     ft <= 0
       ? "SFC"
+      : ft >= 60000
+      ? "UNL"
       : ft >= 18000 && ft % 100 === 0
       ? `FL${Math.round(ft / 100)}`
       : `${ft.toLocaleString()} ft MSL`;
@@ -31,6 +33,23 @@ function formatAltitudeRange(minFt?: number, maxFt?: number): string | null {
   }
   if (minFt !== undefined) return `From ${fmt(minFt)}`;
   return `Up to ${fmt(maxFt!)}`;
+}
+
+function formatAreaSqKm(areaSqKm: number): string {
+  if (!Number.isFinite(areaSqKm) || areaSqKm <= 0) {
+    return "Point / Station";
+  }
+  if (areaSqKm < 10) {
+    return `${areaSqKm.toFixed(1)} km²`;
+  }
+  return `${Math.round(areaSqKm).toLocaleString()} km²`;
+}
+
+function formatDurationHours(hours: number): string {
+  if (!Number.isFinite(hours) || hours <= 0) return "Instant / Point";
+  if (hours < 24) return `${hours.toFixed(1)} hrs`;
+  const days = hours / 24;
+  return `${days.toFixed(1)} days (${Math.round(hours)}h)`;
 }
 
 export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
@@ -161,7 +180,7 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
         peak72h === null
       ) {
         statusLine.textContent =
-          "No offshore wave grid cell at clicked coordinate (land/coastal mask). Click an open-water point inside this NAVAREA for live wave telemetry.";
+          "No offshore wave grid cell at clicked coordinate (land/coastal mask). Click an open-water point inside this warning zone for live wave telemetry.";
         return;
       }
 
@@ -245,6 +264,13 @@ export function initDetailDrawer(mount: HTMLElement): DetailDrawerController {
     titleEl.textContent = properties.title;
 
     metaGrid.replaceChildren();
+    addMetaItem("Issued By", properties.issuer || "Unknown Authority");
+    addMetaItem(
+      "Country / Region",
+      `${properties.country || "Global"} (${properties.region || "Global"})`
+    );
+    addMetaItem("Footprint Size", formatAreaSqKm(properties.areaSqKm));
+    addMetaItem("Duration", formatDurationHours(properties.durationHours));
     addMetaItem("Effective From", formatUtcTimestamp(properties.validFrom));
     addMetaItem("Effective Until", formatUtcTimestamp(properties.validTo));
     addMetaItem("Issued At", formatUtcTimestamp(properties.issuedAt));
